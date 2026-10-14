@@ -1,0 +1,3 @@
+interface:
+  display_name: "Document Analysis"
+  short_description: "Extract, OCR, inspect, and verify documents safely"
