@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -59,14 +60,34 @@ def main() -> int:
             }
         )
     payload = {"schema_version": 1, "source": str(source), "page_count": len(document), "pages": pages}
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=analysis_dir, delete=False) as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary = Path(stream.name)
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
     version = getattr(pymupdf, "__version__", "unknown")
     script_dir = Path(__file__).resolve().parent
-    status = os.spawnv(
-        os.P_WAIT,
-        sys.executable,
-        [sys.executable, str(script_dir / "record-manifest.py"), str(analysis_dir), "--processor", "pymupdf", "--version", version, "--artifact", str(output)],
-    )
+    try:
+        status = os.spawnv(
+            os.P_WAIT,
+            sys.executable,
+            [sys.executable, str(script_dir / "record-manifest.py"), str(analysis_dir), "--processor", "pymupdf", "--version", version, "--artifact", str(output)],
+        )
+    except OSError as error:
+        print(f"Could not record PyMuPDF artifact: {error}", file=sys.stderr)
+        status = 1
+    if status != 0:
+        try:
+            output.unlink()
+        except OSError as error:
+            print(f"Could not remove unrecorded artifact: {error}", file=sys.stderr)
+        return status
     return status
 
 
