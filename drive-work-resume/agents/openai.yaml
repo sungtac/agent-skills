@@ -1,0 +1,6 @@
+interface:
+  display_name: "Drive Work Resume"
+  short_description: "List current work and search a scoped Drive task"
+  default_prompt: "Use $drive-work-resume to list my current work or search a numbered task."
+policy:
+  allow_implicit_invocation: true
