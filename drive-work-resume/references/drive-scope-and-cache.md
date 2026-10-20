@@ -100,4 +100,4 @@ Every subtree-search response states:
 - folder, query, and page limits reached, if any
 - whether the user requested an exhaustive refresh
 
-A refresh is read-only. It updates only the local cache file; it never changes Google Drive.
+The refresh operation reads Drive and updates only the local cache. The CLI invocation can also retry previously queued history uploads, which write only to the verified task's `_업무기록` folder.
