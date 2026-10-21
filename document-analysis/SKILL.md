@@ -29,5 +29,6 @@ The bundled command scripts target Linux/WSL. In a native Windows runtime, use t
 ## Runtime adapters
 
 - In Codex, read [adapters/codex.md](references/adapters/codex.md).
+- In Claude Code, read [adapters/claude.md](references/adapters/claude.md).
 - In Hermes, read [adapters/hermes.md](references/adapters/hermes.md).
 - In another runtime, use the generic rules above and identify its file and cloud-document access method before acting.

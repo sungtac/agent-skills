@@ -114,27 +114,37 @@ def read_config(path: Path) -> dict[str, Any]:
         # Source selects the work-library backend. Absence or "drive" keeps the
         # Google Drive behavior; "local" points the same year-folder > NN번 task
         # structure at a local filesystem directory (no rclone, no cache needed).
-        source = config.get("source") or {"type": "drive"}
-        if not isinstance(source, dict):
-            raise ValueError("source must be an object")
-        stype = source.get("type", "drive")
-        if stype == "local":
-            root = Path(str(source["root"])).expanduser()
-            if not root.is_absolute() or not root.is_dir():
-                raise ValueError("Local source root must be an existing absolute directory")
-            config["_source"] = {"type": "local", "root": root}
-        elif stype == "drive":
-            drive_id(config["year_parent"]["id"])
+        config["_source"] = _library(config, config.get("source") or {"type": "drive"}, primary=True)
+        # An optional mirror is the other library kind; work history is kept in
+        # sync with it (work_history.sync_history) so one source never hides the
+        # records written while the other was in use.
+        if config.get("mirror") is not None:
+            config["_mirror"] = _library(config, config["mirror"], primary=False)
+            if config["_mirror"]["type"] == config["_source"]["type"]:
+                raise ValueError("mirror must be the other library type")
+        return config
+    except (OSError, KeyError, TypeError, AttributeError, ValueError, re.error) as exc:
+        raise WorkError("Private work-library configuration is missing or invalid") from exc
+
+
+def _library(config: dict[str, Any], spec: Any, primary: bool) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        raise ValueError("A library must be an object")
+    kind = spec.get("type", "drive")
+    if kind == "local":
+        root = Path(str(spec["root"])).expanduser()
+        if not root.is_absolute() or not root.is_dir():
+            raise ValueError("Local library root must be an existing absolute directory")
+        return {"type": "local", "root": root}
+    if kind == "drive":
+        drive_id(config["year_parent"]["id"])
+        if primary:  # cache limits only govern listing/search of the primary library
             limits = config["cache"]
             for key in ("max_parent_ids_per_index_query", "max_parent_queries", "max_age_hours"):
                 if int(limits[key]) < 1:
                     raise ValueError("Invalid cache limit")
-            config["_source"] = {"type": "drive"}
-        else:
-            raise ValueError("Unsupported source type")
-        return config
-    except (OSError, KeyError, TypeError, ValueError, re.error) as exc:
-        raise WorkError("Private work-library configuration is missing or invalid") from exc
+        return {"type": "drive"}
+    raise ValueError("Unsupported library type")
 
 
 def parent_filter(parent_ids: list[str]) -> str:
@@ -510,7 +520,7 @@ def main() -> int:
         config = read_config(args.config)
         backend = work_history.make_backend(config)
         result = execute(backend, config, parse_request(args.text))
-    except (WorkError, work_history.WorkError, OSError, ValueError, KeyError) as exc:
+    except (WorkError, work_history.WorkError, OSError, ValueError, KeyError, TypeError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 1
     # Bind only after a scoped task has been resolved. A conflicting unsaved

@@ -4,6 +4,7 @@ import re
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from datetime import date, datetime
@@ -13,7 +14,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from drive_work_resume import FOLDER_MIME, WorkError
 from work_history import (HistoryDrive, bind, checkpoint, flush, queued, read_history,
-                          resolve, session_state, validate_snapshot)
+                          resolve, session_id, session_state, validate_snapshot)
 
 
 def item(item_id, name, parent, mime=FOLDER_MIME):
@@ -246,6 +247,33 @@ class WorkHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkError, 'conflicts'):
             drive.upload('folder', '2026-10-01_100000_000000_' + 'a' * 32 + '.md', 'our body')
         self.assertEqual(drive.calls, [])
+
+
+class SessionIdTests(unittest.TestCase):
+    """The host session ID is provider-neutral: Codex and Claude Code both bind."""
+
+    def session(self, env):
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ('CODEX_SESSION_ID', 'CLAUDE_CODE_SESSION_ID')}
+        with unittest.mock.patch.dict('os.environ', {**clean, **env}, clear=True):
+            return session_id()
+
+    def test_codex_session_id(self):
+        self.assertEqual(self.session({'CODEX_SESSION_ID': 'codex_1'}), 'codex_1')
+
+    def test_claude_code_session_id(self):
+        uuid_like = '5c34491d-ff87-4b9a-af2b-5edf13d7922e'
+        self.assertEqual(self.session({'CLAUDE_CODE_SESSION_ID': uuid_like}), uuid_like)
+
+    def test_codex_wins_when_both_are_set(self):
+        self.assertEqual(self.session({'CODEX_SESSION_ID': 'codex_1',
+                                       'CLAUDE_CODE_SESSION_ID': 'claude_1'}), 'codex_1')
+
+    def test_missing_or_invalid_session_id_is_an_error(self):
+        with self.assertRaises(WorkError):
+            self.session({})
+        with self.assertRaises(WorkError):
+            self.session({'CLAUDE_CODE_SESSION_ID': '../escape'})
 
 
 if __name__ == '__main__':
