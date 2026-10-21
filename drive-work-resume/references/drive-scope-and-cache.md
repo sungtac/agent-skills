@@ -30,6 +30,21 @@ Store private configuration at ~/.codex/drive-work-resume/config.json with owner
 
 active_year.mode: system means the current system year. Set override only when the owner deliberately wants a different year. A missing matching year folder is an error to report, not a reason to search another year.
 
+### Local folder source
+
+To point the same year-folder > `NN번` task structure at a local directory instead of Drive, add a `source` block. `year_parent`, `cache`, and the rclone remote are then unnecessary.
+
+~~~json
+{
+  "schema_version": 1,
+  "active_year": { "mode": "system", "override": null },
+  "task_number_regex": "^(?P<number>0*[1-9][0-9]{0,2})_",
+  "source": { "type": "local", "root": "/absolute/path/to/02_업무" }
+}
+~~~
+
+`root` must be an existing absolute directory; `<root>/<year>/` holds the work books. Absence of `source` (or `"type": "drive"`) keeps the Google Drive backend. Local listing and search are live — there is no cache, so the reported cache is always fresh and complete — and search matches file names/paths only (no content index). A symlinked book or file is never listed or followed. History records are immutable dated files in the selected book's `_업무기록` folder; like Drive, a checkpoint is first queued in a private per-backend outbox (`folder_outbox`, separate from the Drive `outbox`) and then filed, so a failure leaves it pending rather than lost.
+
 ## Task resolution
 
 1. List the configured year folder directly.

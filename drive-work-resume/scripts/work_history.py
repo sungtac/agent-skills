@@ -17,19 +17,14 @@ import tempfile
 import uuid
 from zoneinfo import ZoneInfo
 
-from drive_work_resume import (DEFAULT_CONFIG, FOLDER_MIME, RcloneDrive, WorkError,
-                               current_year, direct_folders, drive_id, file_url,
-                               parent_filter, quote_drive, read_config, resolve_task, year_folder)
+from drive_work_resume import (DEFAULT_CONFIG, FOLDER_MIME, HISTORY_FOLDER, NAME_RE, RcloneDrive,
+                               TaskDeliveryError, WorkError, current_year, drive_id, file_url,
+                               parent_filter, quote_drive, read_config, resolve_task,
+                               write_file_atomically)
 
 STATE_DIR = Path.home() / '.codex/drive-work-resume'
-HISTORY_FOLDER = '_업무기록'
-NAME_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})_(\d{6})_(\d{6})_([a-f0-9]{32})\.md$')
 SESSION_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 FIELDS = ('goal', 'discussion', 'decisions', 'done', 'pending', 'next', 'links')
-
-
-class TaskDeliveryError(WorkError):
-    """A task-specific scope or content conflict, not a general network failure."""
 
 
 def private_dir(path: Path) -> None:
@@ -39,23 +34,7 @@ def private_dir(path: Path) -> None:
 
 def atomic_write(path: Path, contents: str) -> None:
     private_dir(path.parent)
-    name = None
-    try:
-        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=path.parent, delete=False) as handle:
-            name = handle.name
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(contents)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if name and os.path.exists(name):
-            os.unlink(name)
+    write_file_atomically(path, contents, mode=0o600)
 
 
 @contextmanager
@@ -110,8 +89,8 @@ def resolve(drive, config: dict, number: str | None = None, name: str | None = N
         raise WorkError('Select exactly one task number or exact folder name')
     if number is not None and not re.fullmatch(r'0*[1-9][0-9]{0,2}', number):
         raise WorkError('Task number must be a numbered folder prefix')
-    year = year_folder(drive, config)
-    folders = direct_folders(drive, drive_id(year['id']))
+    year = drive.list_year(config)
+    folders = drive.list_books(drive_id(year['id']))
     if number is not None:
         folder = resolve_task(folders, str(int(number)), config['task_number_regex'])
     else:
@@ -119,14 +98,24 @@ def resolve(drive, config: dict, number: str | None = None, name: str | None = N
         if len(matches) != 1:
             raise WorkError(f'Exact task name has {len(matches)} matching folders; do not guess')
         folder = matches[0]
-    return {'id': drive_id(folder['id']), 'name': folder['name'], 'number': str(int(number)) if number else None,
+    task = {'id': drive_id(folder['id']), 'name': folder['name'], 'number': str(int(number)) if number else None,
             'year': current_year(config), 'url': file_url(folder)}
+    if drive.source != 'drive':  # Drive tasks keep their historical shape
+        task['source'] = drive.source
+    return task
 
 
 def bind(state: Path, session: str, task: dict, dirty: bool = True) -> dict:
     with lock(state):
         old = session_state(state, session)
         if old.get('dirty') and old.get('task', {}).get('id') != task['id']:
+            old_source = old.get('task', {}).get('source', 'drive')
+            if old_source != task.get('source', 'drive'):
+                # Without this hint a source switch leaves the session stuck:
+                # the other backend refuses to file the old task (see checkpoint).
+                raise WorkError(f'Previous task has unsaved work in the {old_source} work library; '
+                                f'switch the config source back to {old_source} and checkpoint it '
+                                'before switching tasks')
             raise WorkError('Previous task has unsaved work; checkpoint it before switching tasks')
         value = {'schema_version': 1, 'task': task, 'dirty': bool(dirty or old.get('dirty'))}
         save_session(state, session, value)
@@ -159,8 +148,8 @@ def validate_task(drive, config: dict, task: dict) -> dict:
     if not re.fullmatch(r'\d{4}', year):
         raise WorkError('Stored task year is invalid')
     old_config = {**config, 'active_year': {**config['active_year'], 'override': year}}
-    target_year = year_folder(drive, old_config)
-    matches = [entry for entry in direct_folders(drive, drive_id(target_year['id']))
+    target_year = drive.list_year(old_config)
+    matches = [entry for entry in drive.list_books(drive_id(target_year['id']))
                if entry.get('id') == task.get('id')]
     if len(matches) != 1:
         raise TaskDeliveryError('The bound task is no longer a verified direct child of its year folder')
@@ -219,8 +208,10 @@ def valid_envelope(value) -> dict:
     return value
 
 
-def queued(state: Path, task_id: str | None = None) -> list[tuple[Path, dict]]:
-    folder = state / 'outbox'
+def queued(state: Path, task_id: str | None = None, outbox: str = 'outbox') -> list[tuple[Path, dict]]:
+    # Each backend keeps its own outbox directory so a queued record is only
+    # ever delivered by the backend that created it.
+    folder = state / outbox
     if not folder.exists():
         return []
     result = []
@@ -297,7 +288,7 @@ def flush_locked(drive, config: dict, state: Path, task_id: str | None = None) -
     delivered = 0
     failures = []
     blocked_tasks = set()
-    for path, value in queued(state, task_id):
+    for path, value in queued(state, task_id, drive.outbox):
         if value['task']['id'] in blocked_tasks:
             continue
         try:
@@ -313,7 +304,7 @@ def flush_locked(drive, config: dict, state: Path, task_id: str | None = None) -
         except (WorkError, OSError) as exc:
             failures.append(str(exc))
             break  # Avoid repeated network failures; retain this and later items.
-    remaining = len(queued(state, task_id))
+    remaining = len(queued(state, task_id, drive.outbox))
     return {'delivered': delivered, 'pending': remaining, 'issues': list(dict.fromkeys(failures))}
 
 
@@ -326,6 +317,11 @@ def checkpoint(drive, config: dict, state: Path, session: str, snapshot, now: da
     snapshot = validate_snapshot(snapshot)
     with lock(state):
         task = binding(state, session)
+        # A task bound under one work library must never be filed into another.
+        bound_source = task.get('source', 'drive')
+        if bound_source != drive.source:
+            raise WorkError(f'The bound task belongs to a different work library ({bound_source}); '
+                            f'switch the config source back to {bound_source} to checkpoint it')
         # Offline should not lose a summary: verified binding is checked again during delivery.
         stamp = now or datetime.now(ZoneInfo('Asia/Seoul'))
         if stamp.tzinfo is None:
@@ -335,7 +331,7 @@ def checkpoint(drive, config: dict, state: Path, session: str, snapshot, now: da
         filename = stamp.strftime('%Y-%m-%d_%H%M%S_%f_') + event + '.md'
         envelope = {'schema_version': 1, 'task': task, 'filename': filename,
                     'body': render(task, snapshot, stamp, event)}
-        atomic_write(state / 'outbox' / (event + '.json'), json.dumps(envelope, ensure_ascii=False) + '\n')
+        atomic_write(state / drive.outbox / (event + '.json'), json.dumps(envelope, ensure_ascii=False) + '\n')
         try:
             current = session_state(state, session)
             if current.get('task', {}).get('id') == task['id']:
@@ -377,8 +373,8 @@ def read_history(drive, config: dict, state: Path, task: dict, start: date | Non
                     continue
                 if name in candidates:
                     raise WorkError('Duplicate remote history filename; manual resolution required')
-                candidates[name] = {'source': 'drive', 'item': item}
-        local_records = queued(state, task['id'])
+                candidates[name] = {'source': drive.source, 'item': item}
+        local_records = queued(state, task['id'], drive.outbox)
     for _, value in local_records:
         name = value['filename']
         day = date.fromisoformat(NAME_RE.fullmatch(name).group(1))
@@ -399,11 +395,26 @@ def read_history(drive, config: dict, state: Path, task: dict, start: date | Non
         entry = candidates[name]
         body = entry.get('body') if entry['source'] == 'pending' else drive.download(folder, name)
         result.append({'filename': name, 'source': entry['source'], 'body': body,
-                       'url': file_url(entry['item']) if entry['source'] == 'drive' else None})
+                       'url': file_url(entry['item']) if entry['source'] != 'pending' else None})
     return {'task': task['name'], 'records': result, 'matched': len(names),
             'truncated': len(names) > limit,
             'next_before': names[limit - 1] if len(names) > limit else None,
             'pending': len(local_records)}
+
+
+def make_backend(config: dict):
+    """Select the work-library backend once from the config normalized by read_config."""
+    source = config.get('_source')
+    if source is None:
+        # A raw config that names a source was never validated; silently falling
+        # back to Drive would run rclone against the wrong library.
+        if config.get('source') is not None:
+            raise WorkError('Configuration must be loaded with read_config before use')
+        source = {'type': 'drive'}
+    if source['type'] == 'local':
+        from local_source import LocalBackend
+        return LocalBackend()
+    return HistoryDrive(config.get('rclone_remote', 'gdrive:'))
 
 
 def parse_date(value: str) -> date:
@@ -437,7 +448,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config = read_config(args.config)
-        drive = HistoryDrive(config.get('rclone_remote', 'gdrive:'))
+        drive = make_backend(config)
         if args.command == 'bind':
             result = {'binding': bind(args.state_dir, session_id(), resolve(drive, config, args.task, args.name)),
                       'sync': flush(drive, config, args.state_dir)}

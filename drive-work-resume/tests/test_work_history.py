@@ -20,7 +20,9 @@ def item(item_id, name, parent, mime=FOLDER_MIME):
     return {'id': item_id, 'name': name, 'parents': [parent], 'mimeType': mime}
 
 
-class FakeHistoryDrive:
+class FakeHistoryDrive(HistoryDrive):
+    # Inherits the backend interface (source/outbox/list_year/list_books); the
+    # Drive transport methods below are faked.
     def __init__(self):
         self.items = [item('year', '2026', 'library'), item('task', '01_업무', 'year'),
                       item('taskB', '02_업무', 'year'), item('unnumbered', '업무 이름', 'year')]

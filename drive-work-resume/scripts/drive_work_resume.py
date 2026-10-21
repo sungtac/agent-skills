@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import errno
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,16 @@ class GroupQueryError(WorkError):
     """A Drive query was rejected as an invalid grouped filter."""
 
 
+class TaskDeliveryError(WorkError):
+    """A task-specific scope or content conflict, not a general network failure."""
+
+
+# Shared by every backend. Defined here (not in work_history) so a backend never
+# has to import work_history, which is also run directly as ``__main__``.
+HISTORY_FOLDER = "_업무기록"
+NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{6})_(\d{6})_([a-f0-9]{32})\.md$")
+
+
 def quote_drive(value: str) -> str:
     """Quote a literal for the Google Drive query language."""
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
@@ -40,6 +51,17 @@ def drive_id(value: Any) -> str:
 
 
 class RcloneDrive:
+    """Google Drive work-library backend (rclone).
+
+    Backend interface shared with local_source.LocalBackend: ``source``,
+    ``outbox``, ``list_year(config)``, ``list_books(parent_id)`` and
+    ``run_task(config, request, task)``; work_history.HistoryDrive adds the
+    history methods (``history_folder``, ``children``, ``upload``, ``download``).
+    """
+
+    source = "drive"
+    outbox = "outbox"
+
     def __init__(self, remote: str = "gdrive:") -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]+:", remote):
             raise WorkError("Invalid rclone remote")
@@ -71,20 +93,45 @@ class RcloneDrive:
             raise WorkError("Google Drive returned an unexpected query response")
         return items
 
+    def list_year(self, config: dict[str, Any]) -> dict[str, Any]:
+        return year_folder(self, config)
+
+    def list_books(self, parent_id: str) -> list[dict[str, Any]]:
+        return direct_folders(self, parent_id)
+
+    def run_task(self, config: dict[str, Any], request: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+        return drive_task_operation(self, config, request, task)
+
 
 def read_config(path: Path) -> dict[str, Any]:
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
-        drive_id(config["year_parent"]["id"])
         if config.get("schema_version") != 1:
             raise ValueError("Unsupported schema")
         if config["active_year"].get("mode") != "system":
             raise ValueError("Unsupported year mode")
         re.compile(config["task_number_regex"])
-        limits = config["cache"]
-        for key in ("max_parent_ids_per_index_query", "max_parent_queries", "max_age_hours"):
-            if int(limits[key]) < 1:
-                raise ValueError("Invalid cache limit")
+        # Source selects the work-library backend. Absence or "drive" keeps the
+        # Google Drive behavior; "local" points the same year-folder > NN번 task
+        # structure at a local filesystem directory (no rclone, no cache needed).
+        source = config.get("source") or {"type": "drive"}
+        if not isinstance(source, dict):
+            raise ValueError("source must be an object")
+        stype = source.get("type", "drive")
+        if stype == "local":
+            root = Path(str(source["root"])).expanduser()
+            if not root.is_absolute() or not root.is_dir():
+                raise ValueError("Local source root must be an existing absolute directory")
+            config["_source"] = {"type": "local", "root": root}
+        elif stype == "drive":
+            drive_id(config["year_parent"]["id"])
+            limits = config["cache"]
+            for key in ("max_parent_ids_per_index_query", "max_parent_queries", "max_age_hours"):
+                if int(limits[key]) < 1:
+                    raise ValueError("Invalid cache limit")
+            config["_source"] = {"type": "drive"}
+        else:
+            raise ValueError("Unsupported source type")
         return config
     except (OSError, KeyError, TypeError, ValueError, re.error) as exc:
         raise WorkError("Private work-library configuration is missing or invalid") from exc
@@ -259,20 +306,52 @@ def load_cache(config: dict[str, Any], root_id: str, number: str) -> dict[str, A
     return None
 
 
-def save_cache(config: dict[str, Any], cache: dict[str, Any]) -> None:
-    path = cache_path(config, cache["task_folder_id"])
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+def write_file_atomically(path: Path, contents: str, *, mode: int, exclusive: bool = False) -> None:
+    """Write through a synced temporary file, then publish it in one step.
+
+    The single implementation behind the private state, cache, and history writers.
+    With ``exclusive`` an existing file is never replaced: FileExistsError is
+    raised instead, so immutable records cannot be overwritten by a racing writer.
+    """
     temp_name = None
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
             temp_name = handle.name
-            os.fchmod(handle.fileno(), 0o600)
-            json.dump(cache, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_name, path)
+            os.fchmod(handle.fileno(), mode)
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not exclusive:
+            os.replace(temp_name, path)
+        else:
+            try:
+                os.link(temp_name, path)  # atomic create-if-absent
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                if exc.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK):
+                    raise
+                # Filesystems without hard links: still create exclusively.
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(contents)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
+
+
+def save_cache(config: dict[str, Any], cache: dict[str, Any]) -> None:
+    path = cache_path(config, cache["task_folder_id"])
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    write_file_atomically(path, json.dumps(cache, ensure_ascii=False, indent=2), mode=0o600)
 
 
 def cache_is_stale(cache: dict[str, Any], max_age_hours: int) -> bool:
@@ -339,11 +418,12 @@ def index_search(
     return list(found.values()), {"queries": calls, "complete": not problems, "issues": list(dict.fromkeys(problems))}
 
 
-def execute(drive: RcloneDrive, config: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+def execute(drive: Any, config: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    """Run a parsed request against any backend (Drive or local folder)."""
     if request["intent"] == "unrecognized":
         raise WorkError(request["reason"])
-    year = year_folder(drive, config)
-    folders = direct_folders(drive, drive_id(year["id"]))
+    year = drive.list_year(config)
+    folders = drive.list_books(drive_id(year["id"]))
     if request["intent"] == "list_current_tasks":
         return {
             "intent": request["intent"], "year": current_year(config),
@@ -353,6 +433,13 @@ def execute(drive: RcloneDrive, config: dict[str, Any], request: dict[str, Any])
             ],
         }
     task = resolve_task(folders, request["task_number"], config["task_number_regex"])
+    return drive.run_task(config, request, task)
+
+
+def drive_task_operation(
+    drive: RcloneDrive, config: dict[str, Any], request: dict[str, Any], task: dict[str, Any]
+) -> dict[str, Any]:
+    """Drive refresh/search for one resolved task: metadata cache plus optional index query."""
     root_id = drive_id(task["id"])
     cache = load_cache(config, root_id, request["task_number"])
     reason = "requested" if request["refresh_requested"] else "missing" if cache is None else None
@@ -416,15 +503,18 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".codex/drive-work-resume")
     args = parser.parse_args()
+    # Run as a script, this file is ``__main__`` while work_history/local_source
+    # import it again as ``drive_work_resume``; catch both copies of WorkError.
+    import work_history
     try:
         config = read_config(args.config)
-        result = execute(RcloneDrive(config.get("rclone_remote", "gdrive:")), config, parse_request(args.text))
-    except (WorkError, OSError, ValueError, KeyError) as exc:
+        backend = work_history.make_backend(config)
+        result = execute(backend, config, parse_request(args.text))
+    except (WorkError, work_history.WorkError, OSError, ValueError, KeyError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 1
     # Bind only after a scoped task has been resolved. A conflicting unsaved
     # task is never silently replaced; the search result itself is still useful.
-    import work_history
     if result.get("task"):
         try:
             task = {**result["task"], "year": result["year"]}
@@ -434,8 +524,7 @@ def main() -> int:
             result["history_binding"] = "not_bound"
             result["history_issue"] = str(exc)
     try:
-        sync = work_history.flush(work_history.HistoryDrive(config.get("rclone_remote", "gdrive:")),
-                                  config, args.state_dir)
+        sync = work_history.flush(backend, config, args.state_dir)
         if sync["pending"] or sync["delivered"] or sync["issues"]:
             result["history_sync"] = sync
     except (work_history.WorkError, OSError) as exc:
