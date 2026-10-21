@@ -242,7 +242,15 @@ class LocalBackend:
         book = year / name
         if year.is_symlink() or book.is_symlink():
             raise TaskDeliveryError("A symlink is in the way of the task folder")
-        book.mkdir(parents=True, exist_ok=True)  # umask permissions, like the rest of the library
+        try:
+            year.mkdir(exist_ok=True)  # umask permissions, like the rest of the library
+            # Never reuse an entry list_books did not report: on a case- or
+            # normalization-insensitive filesystem (e.g. /mnt/c) "notes" would
+            # silently open the different book "Notes" and merge their histories.
+            book.mkdir()
+        except FileExistsError:
+            raise TaskDeliveryError(f"Task folder '{name}' cannot be created locally: an existing entry "
+                                    "(a file, or a folder whose name differs only in case) is in the way") from None
         return {"id": self._remember(book), "name": name, "mimeType": FOLDER_MIME,
                 "url": local_url(book)}
 

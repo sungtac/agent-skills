@@ -455,6 +455,8 @@ def _records(backend, book: dict) -> tuple[str | None, dict[str, dict]]:
     for item in backend.children(folder):
         name = item.get('name')
         if isinstance(name, str) and NAME_RE.fullmatch(name) and item.get('mimeType') != FOLDER_MIME:
+            if name in records:  # Drive allows duplicate names; never pick one of them
+                raise TaskDeliveryError(f"Duplicate history filename '{name}'; manual resolution required")
             records[name] = item
     return folder, records
 
@@ -580,17 +582,26 @@ def main() -> int:
             result = {'binding': mark(args.state_dir, session_id()), 'sync': flush(drive, config, args.state_dir)}
         elif args.command == 'checkpoint':
             data = json.loads(args.input.read_text(encoding='utf-8') if args.input else sys.stdin.read())
-            result = checkpoint(drive, config, args.state_dir, session_id(), data)
+            session = session_id()
+            task = binding(args.state_dir, session)
+            result = checkpoint(drive, config, args.state_dir, session, data)
             # Keep the mirror current after every checkpoint; a sync failure never
             # hides the checkpoint result itself.
             mirror = make_mirror(config)
             if mirror:
                 try:
+                    # Sync the year the record was filed under (validate_task), not
+                    # the system year: after New Year they differ.
+                    backend, view = mirror
+                    pin = {'override': str(task.get('year'))}
+                    pinned = {**config, 'active_year': {**config['active_year'], **pin}}
+                    pinned_view = {**view, 'active_year': {**view['active_year'], **pin}}
                     # The state lock serialises syncs on this machine, so two
                     # sessions never upload the same record twice (Drive allows
                     # duplicate names).
                     with lock(args.state_dir):
-                        result['mirror_sync'] = sync_history(drive, config, *mirror, names={result['task']})
+                        result['mirror_sync'] = sync_history(drive, pinned, backend, pinned_view,
+                                                             names={result['task']})
                 except (WorkError, OSError) as exc:
                     result['mirror_sync_error'] = str(exc)
         elif args.command == 'sync':
@@ -601,6 +612,13 @@ def main() -> int:
             if args.task or args.name:
                 names = {resolve(drive, config, args.task, args.name)['name']}
             result = {'flush': flush(drive, config, args.state_dir)}
+            # Records queued while the mirror library was the source sit in its
+            # own outbox, which only that backend delivers; without this they
+            # stay stranded (and out of sync) after a source switch.
+            try:
+                result['mirror_flush'] = flush(*mirror, args.state_dir)
+            except (WorkError, OSError) as exc:
+                result['mirror_flush_error'] = str(exc)
             with lock(args.state_dir):  # see checkpoint: one sync at a time per machine
                 result['mirror_sync'] = sync_history(drive, config, *mirror, names=names)
         elif args.command == 'flush':
