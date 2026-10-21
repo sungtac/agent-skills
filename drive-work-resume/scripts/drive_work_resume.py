@@ -27,6 +27,16 @@ class GroupQueryError(WorkError):
     """A Drive query was rejected as an invalid grouped filter."""
 
 
+class TaskDeliveryError(WorkError):
+    """A task-specific scope or content conflict, not a general network failure."""
+
+
+# Shared by every backend. Defined here (not in work_history) so a backend never
+# has to import work_history, which is also run directly as ``__main__``.
+HISTORY_FOLDER = "_업무기록"
+NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{6})_(\d{6})_([a-f0-9]{32})\.md$")
+
+
 def quote_drive(value: str) -> str:
     """Quote a literal for the Google Drive query language."""
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
@@ -40,6 +50,17 @@ def drive_id(value: Any) -> str:
 
 
 class RcloneDrive:
+    """Google Drive work-library backend (rclone).
+
+    Backend interface shared with local_source.LocalBackend: ``source``,
+    ``outbox``, ``list_year(config)``, ``list_books(parent_id)`` and
+    ``run_task(config, request, task)``; work_history.HistoryDrive adds the
+    history methods (``history_folder``, ``children``, ``upload``, ``download``).
+    """
+
+    source = "drive"
+    outbox = "outbox"
+
     def __init__(self, remote: str = "gdrive:") -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]+:", remote):
             raise WorkError("Invalid rclone remote")
@@ -70,6 +91,15 @@ class RcloneDrive:
         if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
             raise WorkError("Google Drive returned an unexpected query response")
         return items
+
+    def list_year(self, config: dict[str, Any]) -> dict[str, Any]:
+        return year_folder(self, config)
+
+    def list_books(self, parent_id: str) -> list[dict[str, Any]]:
+        return direct_folders(self, parent_id)
+
+    def run_task(self, config: dict[str, Any], request: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+        return drive_task_operation(self, config, request, task)
 
 
 def read_config(path: Path) -> dict[str, Any]:
@@ -353,11 +383,12 @@ def index_search(
     return list(found.values()), {"queries": calls, "complete": not problems, "issues": list(dict.fromkeys(problems))}
 
 
-def execute(drive: RcloneDrive, config: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+def execute(drive: Any, config: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    """Run a parsed request against any backend (Drive or local folder)."""
     if request["intent"] == "unrecognized":
         raise WorkError(request["reason"])
-    year = year_folder(drive, config)
-    folders = direct_folders(drive, drive_id(year["id"]))
+    year = drive.list_year(config)
+    folders = drive.list_books(drive_id(year["id"]))
     if request["intent"] == "list_current_tasks":
         return {
             "intent": request["intent"], "year": current_year(config),
@@ -367,6 +398,13 @@ def execute(drive: RcloneDrive, config: dict[str, Any], request: dict[str, Any])
             ],
         }
     task = resolve_task(folders, request["task_number"], config["task_number_regex"])
+    return drive.run_task(config, request, task)
+
+
+def drive_task_operation(
+    drive: RcloneDrive, config: dict[str, Any], request: dict[str, Any], task: dict[str, Any]
+) -> dict[str, Any]:
+    """Drive refresh/search for one resolved task: metadata cache plus optional index query."""
     root_id = drive_id(task["id"])
     cache = load_cache(config, root_id, request["task_number"])
     reason = "requested" if request["refresh_requested"] else "missing" if cache is None else None
@@ -430,19 +468,18 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".codex/drive-work-resume")
     args = parser.parse_args()
+    # Run as a script, this file is ``__main__`` while work_history/local_source
+    # import it again as ``drive_work_resume``; catch both copies of WorkError.
+    import work_history
     try:
         config = read_config(args.config)
-        if (config.get("_source") or {}).get("type") == "local":
-            import local_source
-            result = local_source.execute_local(config, parse_request(args.text))
-        else:
-            result = execute(RcloneDrive(config.get("rclone_remote", "gdrive:")), config, parse_request(args.text))
-    except (WorkError, OSError, ValueError, KeyError) as exc:
+        backend = work_history.make_backend(config)
+        result = execute(backend, config, parse_request(args.text))
+    except (WorkError, work_history.WorkError, OSError, ValueError, KeyError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 1
     # Bind only after a scoped task has been resolved. A conflicting unsaved
     # task is never silently replaced; the search result itself is still useful.
-    import work_history
     if result.get("task"):
         try:
             task = {**result["task"], "year": result["year"]}
@@ -451,16 +488,12 @@ def main() -> int:
         except (work_history.WorkError, OSError) as exc:
             result["history_binding"] = "not_bound"
             result["history_issue"] = str(exc)
-    # Local history writes directly to the task folder, so there is no outbox to
-    # flush; retrying queued uploads applies only to the Drive backend.
-    if (config.get("_source") or {}).get("type") != "local":
-        try:
-            sync = work_history.flush(work_history.HistoryDrive(config.get("rclone_remote", "gdrive:")),
-                                      config, args.state_dir)
-            if sync["pending"] or sync["delivered"] or sync["issues"]:
-                result["history_sync"] = sync
-        except (work_history.WorkError, OSError) as exc:
-            result["history_sync_error"] = str(exc)
+    try:
+        sync = work_history.flush(backend, config, args.state_dir)
+        if sync["pending"] or sync["delivered"] or sync["issues"]:
+            result["history_sync"] = sync
+    except (work_history.WorkError, OSError) as exc:
+        result["history_sync_error"] = str(exc)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

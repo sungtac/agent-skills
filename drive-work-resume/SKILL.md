@@ -14,7 +14,9 @@ Read `references/drive-scope-and-cache.md` for lookup and cache details and `ref
 The `source` block in the config selects the backend (absence means Drive, for backward compatibility):
 
 - `{"type": "drive"}` — the Google Drive library (needs `year_parent.id`, `cache`, and the `gdrive:` remote).
-- `{"type": "local", "root": "/absolute/path"}` — a local directory whose `<root>/<year>/` holds the work books. No rclone, cache, or `year_parent` is needed. Listing and search are live (always current); search is **name/path based only** (there is no content index, so `관련` content search reports that it searched names only). History writes directly into each book's `_업무기록` folder — it is durable immediately, so there is no local outbox/queue and no `sync.pending` to retry. The same commands below work unchanged; a symlinked book or file is skipped so a book cannot redirect outside the configured tree.
+- `{"type": "local", "root": "/absolute/path"}` — a local directory whose `<root>/<year>/` holds the work books. No rclone, cache, or `year_parent` is needed. Listing and search are live (always current); search is **name/path based only** (there is no content index, so `관련` content search reports that it searched names only). The same commands below work unchanged, and history follows the same contract: a checkpoint is queued durably first and then filed into the book's `_업무기록` folder, so `sync.pending` and `source: pending` mean the record is safe on this machine but not yet filed (for example because the book was renamed). Filed local records report `source: local` with a `file://` link and keep normal file permissions, so a shared folder stays readable. A symlinked book or file is never listed or followed, so a book cannot redirect outside the configured tree.
+
+Both backends share one pipeline: the scripts pick the backend once from `source` and run the same listing, binding, checkpoint, flush, and read logic. A task bound under one source is refused by the other.
 
 ## Work list and file search
 

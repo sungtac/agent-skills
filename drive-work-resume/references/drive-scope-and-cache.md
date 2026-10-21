@@ -43,7 +43,7 @@ To point the same year-folder > `NN번` task structure at a local directory inst
 }
 ~~~
 
-`root` must be an existing absolute directory; `<root>/<year>/` holds the work books. Absence of `source` (or `"type": "drive"`) keeps the Google Drive backend. Local listing and search are live — there is no cache and no cache timestamp to disclose — and search matches file and folder names/paths only (no content index). A symlinked book or file is skipped. History records are written straight into the selected book's `_업무기록` folder as immutable dated files; a local write is final (no outbox, no pending sync).
+`root` must be an existing absolute directory; `<root>/<year>/` holds the work books. Absence of `source` (or `"type": "drive"`) keeps the Google Drive backend. Local listing and search are live — there is no cache, so the reported cache is always fresh and complete — and search matches file names/paths only (no content index). A symlinked book or file is never listed or followed. History records are immutable dated files in the selected book's `_업무기록` folder; like Drive, a checkpoint is first queued in a private per-backend outbox (`folder_outbox`, separate from the Drive `outbox`) and then filed, so a failure leaves it pending rather than lost.
 
 ## Task resolution
 

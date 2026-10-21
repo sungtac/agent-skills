@@ -19,7 +19,8 @@ def item(item_id, name, parent, mime=FOLDER_MIME):
     return {"id": item_id, "name": name, "parents": [parent], "mimeType": mime}
 
 
-class FakeDrive:
+class FakeDrive(RcloneDrive):
+    # Inherits the backend interface (list_year/list_books/run_task); only query is faked.
     def __init__(self, reject_groups=False, add_outside_result=False):
         self.reject_groups = reject_groups
         self.add_outside_result = add_outside_result
