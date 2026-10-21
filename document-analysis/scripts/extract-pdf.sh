@@ -60,10 +60,14 @@ diagnostics_log="$analysis_dir/poppler-diagnostics.log"
 [[ ! -e "$diagnostics_log" ]] || { echo "Refusing to overwrite existing artifact: $diagnostics_log" >&2; exit 1; }
 diagnostics_temp="$(mktemp "${TMPDIR:-/tmp}/document-analysis-poppler-diagnostics.XXXXXX")"
 trap 'rm -f -- "$diagnostics_temp"' EXIT
-if [[ "$layout" == true ]]; then
-  pdftotext -layout "$source_path" "$output" 2>"$diagnostics_temp"
-else
-  pdftotext "$source_path" "$output" 2>"$diagnostics_temp"
+pdftotext_args=()
+[[ "$layout" == true ]] && pdftotext_args=(-layout)
+if ! pdftotext ${pdftotext_args[@]+"${pdftotext_args[@]}"} "$source_path" "$output" 2>"$diagnostics_temp"; then
+  # Show why it failed and drop any partial output so a retry is not blocked.
+  cat -- "$diagnostics_temp" >&2
+  rm -f -- "$output"
+  echo "Poppler extraction failed: $source_path" >&2
+  exit 1
 fi
 
 [[ -s "$output" ]] || { echo "Poppler created an empty extraction: $output" >&2; exit 1; }

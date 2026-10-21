@@ -57,7 +57,11 @@ def main() -> int:
             for artifact in arguments.artifact:
                 candidate = Path(artifact)
                 if not candidate.is_absolute():
-                    candidate = analysis_dir / candidate
+                    # The extract scripts pass "<analysis-dir>/<name>", which is
+                    # relative to the working directory when analysis-dir is.
+                    from_cwd = candidate.resolve()
+                    if not (from_cwd.is_file() and from_cwd.is_relative_to(analysis_dir)):
+                        candidate = analysis_dir / candidate
                 candidate = candidate.resolve()
                 try:
                     relative = candidate.relative_to(analysis_dir)
