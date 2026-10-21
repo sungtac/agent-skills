@@ -26,7 +26,7 @@ Instead, configure the other library as a `mirror` (`{"type": "local", "root": "
 
 - Every `checkpoint` syncs that task with the mirror and reports `mirror_sync` (or `mirror_sync_error`).
 - `python3 scripts/work_history.py sync` syncs every task of the current year; `--task 18` or `--name '<exact name>'` limits it to one. Run it after setting up a mirror and before switching `source`, then report the counts.
-- Sync is a union merge by task folder name: a record present on one side is copied to the other. Nothing is overwritten or deleted. Same-named records with different content are listed in `conflicts`; tell the user, and never pick a side automatically. A missing local task folder is created when it has history to receive; a missing Drive task folder is never created and is listed in `skipped`.
+- Sync is a union merge by task folder name: a record present on one side is copied to the other. Nothing is overwritten or deleted. Same-named records with different content are listed in `conflicts`; tell the user, and never pick a side automatically. A missing local task folder is created when it has history to receive; a missing Drive task folder is never created and is listed in `skipped`, as is a task name shared by several folders (never guessed).
 - Only `_업무기록` records are synced. The work files themselves stay where they are; to have them in both places, use the Google Drive desktop client and point the local library at its synced folder.
 
 Switching `source` is then safe: sync, checkpoint the bound task, and switch; both libraries hold the same history.

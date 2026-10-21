@@ -466,9 +466,13 @@ def _same_record(a, a_folder: str, a_item: dict, b, b_folder: str, b_item: dict,
     return a.download(a_folder, name, strict=True) == b.download(b_folder, name, strict=True)
 
 
-def _books(backend, config: dict) -> dict[str, dict]:
+def _books(backend, config: dict) -> dict[str, dict | None]:
+    # A name shared by several folders (Drive allows it) maps to None: ambiguous, never guessed.
     year = backend.list_year(config)
-    return {book['name']: book for book in backend.list_books(drive_id(year['id']))}
+    books: dict[str, dict | None] = {}
+    for book in backend.list_books(drive_id(year['id'])):
+        books[book['name']] = None if book['name'] in books else book
+    return books
 
 
 def sync_history(primary, config: dict, mirror, mirror_config: dict, names: set | None = None) -> dict:
@@ -497,6 +501,8 @@ def sync_history(primary, config: dict, mirror, mirror_config: dict, names: set 
     for name in targets:
         try:
             p_book, m_book = primary_books.get(name), mirror_books.get(name)
+            if (name in primary_books and p_book is None) or (name in mirror_books and m_book is None):
+                raise TaskDeliveryError('Task folder name is ambiguous (several folders share it); do not guess')
             p_folder, p_records = _records(primary, p_book) if p_book else (None, {})
             m_folder, m_records = _records(mirror, m_book) if m_book else (None, {})
             if not p_records and not m_records:

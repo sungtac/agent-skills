@@ -174,6 +174,20 @@ class DriveMirrorTests(SyncCase):
         self.assertIn("not UTF-8", report["skipped"][0])
         self.assertFalse((self.history(self.a) / bad).exists())
 
+    def test_duplicate_drive_task_names_are_skipped_not_guessed(self):
+        class DuplicateDrive(FakeDriveMirror):
+            def list_books(self, parent_id):
+                return [{"id": "idA", "name": "01_기획", "mimeType": FOLDER_MIME},
+                        {"id": "idB", "name": "01_기획", "mimeType": FOLDER_MIME}]
+
+        self.put(self.a, record_name(1, "a"), "로컬 기록")
+        drive = DuplicateDrive(records={"idA": {record_name(2, "b"): "A 기록"}, "idB": {}})
+        report = sync_history(LocalBackend(), self.config, drive, self.config)
+        self.assertIn("ambiguous", report["skipped"][0])
+        self.assertFalse(report["complete"])
+        self.assertEqual(drive.records, {"idA": {record_name(2, "b"): "A 기록"}, "idB": {}})
+        self.assertFalse((self.history(self.a) / record_name(2, "b")).exists())
+
 
 class MirrorConfigTests(unittest.TestCase):
     def setUp(self):
