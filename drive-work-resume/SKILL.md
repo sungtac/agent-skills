@@ -20,11 +20,16 @@ Both backends share one pipeline: the scripts pick the backend once from `source
 
 ### Choosing a source: one canonical library
 
-Exactly one source is active at a time, and Drive is the default when `source` is absent. There is deliberately no automatic priority or fallback between Drive and a local folder: alternating would split one task's history across two libraries, and a resumption briefing would silently miss half of it. When the user sets up or changes the source, advise them to:
+Exactly one source is active at a time, and Drive is the default when `source` is absent. There is deliberately no automatic priority or fallback between Drive and a local folder: alternating would otherwise split one task's history across two libraries.
 
-1. Pick one canonical library. If Google Drive is synced to the computer (Google Drive for desktop), pointing the local source at that synced folder gives offline use while the sync client uploads the records; then use only the local source and do not alternate with the Drive source.
-2. Before switching, checkpoint the bound task. History is not merged automatically: copy each task's `_업무기록` folder to the same task folder in the new library so resumption keeps the earlier records.
-3. Never edit the same task in both libraries independently.
+Instead, configure the other library as a `mirror` (`{"type": "local", "root": "/absolute/path"}` under a Drive source, or `{"type": "drive"}` under a local source). Work history is then kept in sync automatically — do it, do not merely advise it:
+
+- Every `checkpoint` syncs that task with the mirror and reports `mirror_sync` (or `mirror_sync_error`).
+- `python3 scripts/work_history.py sync` syncs every task of the current year; `--task 18` or `--name '<exact name>'` limits it to one. Run it after setting up a mirror and before switching `source`, then report the counts.
+- Sync is a union merge by task folder name: a record present on one side is copied to the other. Nothing is overwritten or deleted. Same-named records with different content are listed in `conflicts`; tell the user, and never pick a side automatically. A missing local task folder is created when it has history to receive; a missing Drive task folder is never created and is listed in `skipped`.
+- Only `_업무기록` records are synced. The work files themselves stay where they are; to have them in both places, use the Google Drive desktop client and point the local library at its synced folder.
+
+Switching `source` is then safe: sync, checkpoint the bound task, and switch; both libraries hold the same history.
 
 ## Work list and file search
 
@@ -73,6 +78,6 @@ Records are sorted by the date and time in their filename, not Drive modified ti
 
 ## Boundaries and model cost
 
-Listing, file search, and cache refresh themselves only read Drive, but their invocation also retries previously queued history uploads. History writes are confined to the selected direct-child task's `_업무기록` folder; never overwrite existing history, modify other task files, share, or delete user data. Different checkpoints create distinct immutable dated files. A normal Stop audit can remind the model to checkpoint, but cannot save a conversation after a crash or guarantee model compliance. The helper requires a host-provided session ID for safe per-session binding. Do not claim complete automatic coverage.
+Listing, file search, and cache refresh themselves only read Drive, but their invocation also retries previously queued history uploads. History writes are confined to direct-child tasks' `_업무기록` folders: a checkpoint writes only the selected task's, and a mirror sync copies records into the matching task's folder in the other library (creating a missing local task folder, never a Drive one). Never overwrite existing history, modify other task files, share, or delete user data. Different checkpoints create distinct immutable dated files. A normal Stop audit can remind the model to checkpoint, but cannot save a conversation after a crash or guarantee model compliance. The helper requires a host-provided session ID for safe per-session binding. Do not claim complete automatic coverage.
 
 Do not dispatch another worker or model for deterministic listing, searching, or bookkeeping. The host model still interprets the request and prepares the snapshot; this does not mean zero model use.

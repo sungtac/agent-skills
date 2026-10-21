@@ -223,6 +223,8 @@ def queued(state: Path, task_id: str | None = None, outbox: str = 'outbox') -> l
 
 
 class HistoryDrive(RcloneDrive):
+    creates_books = False  # sync never creates task folders on the owner's Drive
+
     def command(self, args: list[str]) -> str:
         command = ['rclone', *args, '--retries', '1', '--low-level-retries', '6',
                    '--contimeout', '8s', '--timeout', '45s']
@@ -278,10 +280,16 @@ class HistoryDrive(RcloneDrive):
         elif self.download(folder, filename) != body:
             raise TaskDeliveryError('Remote history content conflicts with the queued record')
 
-    def download(self, folder: str, filename: str) -> str:
+    def download(self, folder: str, filename: str, strict: bool = False) -> str:
+        # rclone either returns the exact body or fails, so strict needs no extra check.
         if not NAME_RE.fullmatch(filename):
             raise WorkError('Invalid history filename')
         return self.command(['cat', self.remote + filename, '--drive-root-folder-id', folder])
+
+    def ensure_book(self, config: dict, name: str) -> dict:
+        # Task folders on Drive belong to the owner; history sync never creates them.
+        raise TaskDeliveryError(f"Task folder '{name}' does not exist on Drive; "
+                                'create it there to sync its history')
 
 
 def flush_locked(drive, config: dict, state: Path, task_id: str | None = None) -> dict:
@@ -417,6 +425,101 @@ def make_backend(config: dict):
     return HistoryDrive(config.get('rclone_remote', 'gdrive:'))
 
 
+def make_mirror(config: dict):
+    """(mirror backend, config view for it), or None when no mirror is configured."""
+    mirror = config.get('_mirror')
+    if mirror is None:
+        if config.get('mirror') is not None:
+            raise WorkError('Configuration must be loaded with read_config before use')
+        return None
+    view = {**config, '_source': mirror}
+    return make_backend(view), view
+
+
+def _records(backend, book: dict) -> tuple[str | None, dict[str, dict]]:
+    folder = backend.history_folder(book['id'], create=False)
+    if not folder:
+        return None, {}
+    records = {}
+    for item in backend.children(folder):
+        name = item.get('name')
+        if isinstance(name, str) and NAME_RE.fullmatch(name) and item.get('mimeType') != FOLDER_MIME:
+            records[name] = item
+    return folder, records
+
+
+def _same_record(a, a_folder: str, a_item: dict, b, b_folder: str, b_item: dict, name: str) -> bool:
+    a_sum, b_sum = a_item.get('md5Checksum'), b_item.get('md5Checksum')
+    if a_sum and b_sum:
+        return a_sum == b_sum
+    return a.download(a_folder, name, strict=True) == b.download(b_folder, name, strict=True)
+
+
+def _books(backend, config: dict) -> dict[str, dict]:
+    year = backend.list_year(config)
+    return {book['name']: book for book in backend.list_books(drive_id(year['id']))}
+
+
+def sync_history(primary, config: dict, mirror, mirror_config: dict, names: set | None = None) -> dict:
+    """Union-merge work-history records between two libraries, matched by task folder name.
+
+    Records are immutable dated files, so a record found on only one side is copied
+    to the other. Nothing is ever overwritten or deleted: same-named records with
+    different content are reported as conflicts and left as they are. A missing task
+    folder is created only where the backend allows it (local); Drive task folders
+    belong to the owner and are never created.
+    """
+    report = {'books': 0, 'to_mirror': 0, 'to_primary': 0,
+              'conflicts': [], 'skipped': [], 'issues': []}
+    primary_books = _books(primary, config)
+    try:
+        mirror_books = _books(mirror, mirror_config)
+    except WorkError as exc:
+        if not mirror.creates_books:  # cannot be repaired here, e.g. Drive unreachable
+            report['issues'].append(str(exc))
+            report['complete'] = False
+            return report
+        mirror_books = {}  # a new local mirror: its year folder is created on demand
+    targets = sorted(set(primary_books) | set(mirror_books), key=str.casefold)
+    if names is not None:
+        targets = [name for name in targets if name in names]
+    for name in targets:
+        try:
+            p_book, m_book = primary_books.get(name), mirror_books.get(name)
+            p_folder, p_records = _records(primary, p_book) if p_book else (None, {})
+            m_folder, m_records = _records(mirror, m_book) if m_book else (None, {})
+            if not p_records and not m_records:
+                continue
+            if p_book is None:
+                p_book = primary.ensure_book(config, name)
+            if m_book is None:
+                m_book = mirror.ensure_book(mirror_config, name)
+            report['books'] += 1
+            for record in sorted(set(p_records) | set(m_records)):
+                if record in p_records and record in m_records:
+                    if not _same_record(primary, p_folder, p_records[record],
+                                        mirror, m_folder, m_records[record], record):
+                        report['conflicts'].append(f'{name}/{record}')
+                    continue
+                if record in p_records:
+                    body = primary.download(p_folder, record, strict=True)
+                    m_folder = m_folder or mirror.history_folder(m_book['id'], create=True)
+                    mirror.upload(m_folder, record, body)
+                    report['to_mirror'] += 1
+                else:
+                    body = mirror.download(m_folder, record, strict=True)
+                    p_folder = p_folder or primary.history_folder(p_book['id'], create=True)
+                    primary.upload(p_folder, record, body)
+                    report['to_primary'] += 1
+        except TaskDeliveryError as exc:
+            report['skipped'].append(f'{name}: {exc}')
+        except (WorkError, OSError) as exc:
+            report['issues'].append(str(exc))
+            break  # a library or network failure: stop instead of repeating it per task
+    report['complete'] = not (report['conflicts'] or report['skipped'] or report['issues'])
+    return report
+
+
 def parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -437,6 +540,10 @@ def main() -> int:
     cp = sub.add_parser('checkpoint')
     cp.add_argument('--input', type=Path, help='Snapshot JSON file; stdin if omitted')
     sub.add_parser('flush')
+    sy = sub.add_parser('sync', help='Union-merge work history with the configured mirror library')
+    sync_target = sy.add_mutually_exclusive_group()
+    sync_target.add_argument('--task', help='Only this numbered task (default: every task)')
+    sync_target.add_argument('--name', help='Only this exact direct-child folder name')
     rd = sub.add_parser('read')
     read_target = rd.add_mutually_exclusive_group(required=True)
     read_target.add_argument('--task')
@@ -457,6 +564,23 @@ def main() -> int:
         elif args.command == 'checkpoint':
             data = json.loads(args.input.read_text(encoding='utf-8') if args.input else sys.stdin.read())
             result = checkpoint(drive, config, args.state_dir, session_id(), data)
+            # Keep the mirror current after every checkpoint; a sync failure never
+            # hides the checkpoint result itself.
+            mirror = make_mirror(config)
+            if mirror:
+                try:
+                    result['mirror_sync'] = sync_history(drive, config, *mirror, names={result['task']})
+                except (WorkError, OSError) as exc:
+                    result['mirror_sync_error'] = str(exc)
+        elif args.command == 'sync':
+            mirror = make_mirror(config)
+            if not mirror:
+                raise WorkError('No mirror library is configured; add "mirror" to the configuration')
+            names = None
+            if args.task or args.name:
+                names = {resolve(drive, config, args.task, args.name)['name']}
+            result = {'flush': flush(drive, config, args.state_dir),
+                      'mirror_sync': sync_history(drive, config, *mirror, names=names)}
         elif args.command == 'flush':
             result = flush(drive, config, args.state_dir)
         else:

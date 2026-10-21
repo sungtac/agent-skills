@@ -105,9 +105,18 @@ def scan_tree(root: Path, problems: list[str]) -> Iterator[tuple[Path, list[os.D
         pending.extend(Path(entry.path) for entry in reversed(folders))
 
 
+def _md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class LocalBackend:
     source = "local"
     outbox = "folder_outbox"  # separate from the Drive outbox; only this backend delivers it
+    creates_books = True  # history sync may create a missing task folder here
 
     def __init__(self) -> None:
         self._paths: dict[str, Path] = {}
@@ -222,8 +231,20 @@ class LocalBackend:
                     continue
                 path = Path(entry.path)
                 items.append({"id": local_id(path), "name": entry.name, "mimeType": None,
-                              "url": local_url(path)})
+                              "url": local_url(path), "md5Checksum": _md5(path)})
         return sorted(items, key=lambda item: item["name"])
+
+    def ensure_book(self, config: dict[str, Any], name: str) -> dict[str, Any]:
+        """Create (or reuse) the named task folder so synced history has a home."""
+        if not name or name in (".", "..") or "/" in name or "\x00" in name or "�" in name:
+            raise TaskDeliveryError(f"Task folder name '{name}' cannot be created locally")
+        year = config["_source"]["root"] / current_year(config)
+        book = year / name
+        if year.is_symlink() or book.is_symlink():
+            raise TaskDeliveryError("A symlink is in the way of the task folder")
+        book.mkdir(parents=True, exist_ok=True)  # umask permissions, like the rest of the library
+        return {"id": self._remember(book), "name": name, "mimeType": FOLDER_MIME,
+                "url": local_url(book)}
 
     def upload(self, folder_id: str, filename: str, body: str) -> None:
         if not NAME_RE.fullmatch(filename):
@@ -239,10 +260,24 @@ class LocalBackend:
             if target.is_symlink() or read_bounded(target) != body:
                 raise TaskDeliveryError("Remote history content conflicts with the queued record") from None
 
-    def download(self, folder_id: str, filename: str) -> str:
+    def download(self, folder_id: str, filename: str, strict: bool = False) -> str:
+        """Read a record. ``strict`` (used when copying) refuses instead of degrading.
+
+        A lenient read shows a placeholder for an oversized or non-UTF-8 file; a
+        strict read raises, so such a placeholder is never copied to another library.
+        """
         if not NAME_RE.fullmatch(filename):
             raise WorkError("Invalid history filename")
         target = self._folder(folder_id) / filename
         if target.is_symlink() or not target.is_file():
             raise WorkError("History record is missing")
-        return read_bounded(target)
+        if not strict:
+            return read_bounded(target)
+        with open(target, "rb") as handle:
+            raw = handle.read(MAX_RECORD_BYTES + 1)
+        try:
+            if len(raw) > MAX_RECORD_BYTES:
+                raise ValueError("too large")
+            return raw.decode("utf-8")
+        except ValueError:
+            raise TaskDeliveryError(f"'{filename}' is not a valid history record (too large or not UTF-8)") from None

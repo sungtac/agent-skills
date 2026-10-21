@@ -45,7 +45,14 @@ To point the same year-folder > `NN번` task structure at a local directory inst
 
 `root` must be an existing absolute directory; `<root>/<year>/` holds the work books. Absence of `source` (or `"type": "drive"`) keeps the Google Drive backend. Local listing and search are live — there is no cache, so the reported cache is always fresh and complete — and search matches file names/paths only (no content index). A symlinked book or file is never listed or followed. History records are immutable dated files in the selected book's `_업무기록` folder; like Drive, a checkpoint is first queued in a private per-backend outbox (`folder_outbox`, separate from the Drive `outbox`) and then filed, so a failure leaves it pending rather than lost.
 
-Only one source is active. There is no automatic Drive↔local priority or fallback, because alternating would split a task's history across two libraries. Keep one canonical library; when changing it, checkpoint first and copy each task's `_업무기록` folder into the new library (see SKILL.md, "Choosing a source").
+Only one source is active. There is no automatic Drive↔local priority or fallback, because alternating would split a task's history across two libraries. Configure the other library as a `mirror` to keep history in both:
+
+~~~json
+"source": { "type": "drive" },
+"mirror": { "type": "local", "root": "/absolute/path/to/02_업무" }
+~~~
+
+A mirror must be the other library type. `work_history.py sync` (and every checkpoint) union-merges `_업무기록` records by task folder name, never overwriting or deleting, reporting differing same-named records as conflicts, and never creating a Drive task folder (see SKILL.md, "Choosing a source").
 
 ## Task resolution
 
