@@ -586,7 +586,11 @@ def main() -> int:
             mirror = make_mirror(config)
             if mirror:
                 try:
-                    result['mirror_sync'] = sync_history(drive, config, *mirror, names={result['task']})
+                    # The state lock serialises syncs on this machine, so two
+                    # sessions never upload the same record twice (Drive allows
+                    # duplicate names).
+                    with lock(args.state_dir):
+                        result['mirror_sync'] = sync_history(drive, config, *mirror, names={result['task']})
                 except (WorkError, OSError) as exc:
                     result['mirror_sync_error'] = str(exc)
         elif args.command == 'sync':
@@ -596,8 +600,9 @@ def main() -> int:
             names = None
             if args.task or args.name:
                 names = {resolve(drive, config, args.task, args.name)['name']}
-            result = {'flush': flush(drive, config, args.state_dir),
-                      'mirror_sync': sync_history(drive, config, *mirror, names=names)}
+            result = {'flush': flush(drive, config, args.state_dir)}
+            with lock(args.state_dir):  # see checkpoint: one sync at a time per machine
+                result['mirror_sync'] = sync_history(drive, config, *mirror, names=names)
         elif args.command == 'flush':
             result = flush(drive, config, args.state_dir)
         else:

@@ -219,5 +219,42 @@ class MirrorConfigTests(unittest.TestCase):
         self.assertIsNone(work_history.make_mirror(self.load()))
 
 
+class SyncLockTests(unittest.TestCase):
+    def test_cli_sync_holds_the_state_lock(self):
+        # Two sessions syncing at once could upload the same record twice
+        # (Drive allows duplicate names); the CLI must serialise them.
+        import fcntl, io, os
+        from unittest.mock import patch
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        (base / "lib" / "2026").mkdir(parents=True)
+        config = base / "config.json"
+        config.write_text(json.dumps({
+            "schema_version": 1, "active_year": {"mode": "system", "override": "2026"},
+            "task_number_regex": REGEX, "year_parent": {"id": "abc123"},
+            "source": {"type": "local", "root": str(base / "lib")}, "mirror": {"type": "drive"},
+        }), encoding="utf-8")
+        state = base / "state"
+        seen = {}
+
+        def probe(*_args, **_kwargs):
+            fd = os.open(state / "history.lock", os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen["held"] = False
+            except BlockingIOError:
+                seen["held"] = True
+            finally:
+                os.close(fd)
+            return {"complete": True}
+
+        argv = ["work_history.py", "--config", str(config), "--state-dir", str(state), "sync"]
+        with patch.object(sys, "argv", argv), patch.object(work_history, "sync_history", probe), \
+             patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(work_history.main(), 0)
+        self.assertTrue(seen["held"])
+
+
 if __name__ == "__main__":
     unittest.main()
