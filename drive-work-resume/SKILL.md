@@ -18,6 +18,14 @@ The `source` block in the config selects the backend (absence means Drive, for b
 
 Both backends share one pipeline: the scripts pick the backend once from `source` and run the same listing, binding, checkpoint, flush, and read logic. A task bound under one source is refused by the other. If `source` is switched while a task still has unsaved work, switch it back and checkpoint that task first; the error message names the source to return to.
 
+### Choosing a source: one canonical library
+
+Exactly one source is active at a time, and Drive is the default when `source` is absent. There is deliberately no automatic priority or fallback between Drive and a local folder: alternating would split one task's history across two libraries, and a resumption briefing would silently miss half of it. When the user sets up or changes the source, advise them to:
+
+1. Pick one canonical library. If Google Drive is synced to the computer (Google Drive for desktop), pointing the local source at that synced folder gives offline use while the sync client uploads the records; then use only the local source and do not alternate with the Drive source.
+2. Before switching, checkpoint the bound task. History is not merged automatically: copy each task's `_업무기록` folder to the same task folder in the new library so resumption keeps the earlier records.
+3. Never edit the same task in both libraries independently.
+
 ## Work list and file search
 
 Run from the skill directory:
