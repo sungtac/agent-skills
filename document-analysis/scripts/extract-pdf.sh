@@ -17,6 +17,38 @@ fi
 
 [[ -f "$source_path" ]] || { echo "Source PDF does not exist: $source_path" >&2; exit 2; }
 [[ -f "$analysis_dir/manifest.json" ]] || { echo "Analysis directory has no manifest: $analysis_dir" >&2; exit 2; }
+
+# Bind this extraction to the source attested in the manifest. Without this
+# check extract-pdf.sh would happily run pdftotext over a different document
+# than the one prepare-analysis-dir.py recorded, and because verify-result.py
+# only re-checks the manifest's own recorded source against itself, the
+# substituted extraction would still pass strict verification.
+python3 -I - "$analysis_dir/manifest.json" "$source_path" <<'PROVENANCE'
+import hashlib, json, sys
+
+manifest_path, source_path = sys.argv[1], sys.argv[2]
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+try:
+    recorded = json.load(open(manifest_path, encoding="utf-8")).get("source_sha256")
+except (OSError, ValueError) as error:
+    fail(f"Cannot read manifest for provenance check: {error}")
+if not recorded:
+    fail("Manifest has no recorded source_sha256; cannot verify provenance.")
+digest = hashlib.sha256()
+with open(source_path, "rb") as handle:
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
+if digest.hexdigest() != recorded:
+    fail("Source does not match the manifest's recorded source_sha256; "
+         "refusing to extract from a different document than the one analysed.")
+PROVENANCE
+
 command -v pdftotext >/dev/null 2>&1 || { echo "pdftotext is required; install poppler-utils." >&2; exit 127; }
 
 output="$analysis_dir/extracted.txt"
