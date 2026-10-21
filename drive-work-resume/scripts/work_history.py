@@ -406,6 +406,237 @@ def read_history(drive, config: dict, state: Path, task: dict, start: date | Non
             'pending': len(local_records)}
 
 
+# ── Local-filesystem backend ────────────────────────────────────────────────
+# Task identity is the SHA-256 of the book's absolute path (drive_id-compatible),
+# so session binding, locking, and snapshot validation are reused unchanged.
+# A checkpoint is first written durably to a private local outbox and only then
+# filed into the book's `_업무기록` folder, mirroring the Drive outbox guarantee
+# that a validation or write failure never discards the user's summary. The
+# filed record itself keeps normal (umask) permissions so a shared library stays
+# readable by teammates.
+
+LOCAL_OUTBOX = 'local_outbox'
+MAX_LOCAL_RECORD_BYTES = 200000
+
+
+def write_user_file(path: Path, contents: str) -> None:
+    """Atomic write of user content with normal (umask) permissions.
+
+    Unlike atomic_write, it does not force private 0o700/0o600 on the parent, so
+    writing history into a possibly shared work library keeps it readable.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mask = os.umask(0)
+    os.umask(mask)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=path.parent, delete=False) as handle:
+            name = handle.name
+            os.fchmod(handle.fileno(), 0o666 & ~mask)
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
+
+
+def resolve_local(config: dict, number: str | None = None, name: str | None = None) -> dict:
+    if (number is None) == (name is None):
+        raise WorkError('Select exactly one task number or exact folder name')
+    if number is not None and not re.fullmatch(r'0*[1-9][0-9]{0,2}', number):
+        raise WorkError('Task number must be a numbered folder prefix')
+    import local_source
+    books = local_source.local_books(local_source.year_dir(config))
+    if number is not None:
+        folder = resolve_task(books, str(int(number)), config['task_number_regex'])
+    else:
+        matches = [entry for entry in books if entry.get('name') == name]
+        if len(matches) != 1:
+            raise WorkError(f'Exact task name has {len(matches)} matching folders; do not guess')
+        folder = matches[0]
+    return {'id': drive_id(folder['id']), 'name': folder['name'],
+            'number': str(int(number)) if number else None, 'year': current_year(config),
+            'url': folder['url'], 'path': folder['path'], 'source': 'local'}
+
+
+def validate_local_task(config: dict, task: dict) -> Path:
+    # Recheck against the task's original year so a bound task stays verifiable.
+    import local_source
+    year = str(task.get('year', ''))
+    if not re.fullmatch(r'\d{4}', year):
+        raise WorkError('Stored task year is invalid')
+    path = task.get('path')
+    if not isinstance(path, str):
+        raise TaskDeliveryError('Local task has no verified path')
+    raw = Path(path)
+    # Reject a book reached through a symlink before resolving it away.
+    if raw.is_symlink():
+        raise TaskDeliveryError('The bound task path is a symlink')
+    resolved = raw.resolve()
+    old_config = {**config, 'active_year': {**config['active_year'], 'override': year}}
+    year_dir = local_source.year_dir(old_config)
+    if resolved.parent != year_dir or not resolved.is_dir():
+        raise TaskDeliveryError('The bound task is no longer a verified direct child of its year folder')
+    if local_source.local_id(resolved) != task.get('id'):
+        raise TaskDeliveryError('Local task identity does not match its path')
+    return resolved
+
+
+def valid_local_envelope(value) -> dict:
+    if not isinstance(value, dict) or value.get('schema_version') != 1 or value.get('source') != 'local':
+        raise WorkError('Invalid local outbox record')
+    filename = value.get('filename', '')
+    if not (isinstance(filename, str) and NAME_RE.fullmatch(filename)):
+        raise WorkError('Invalid local outbox filename')
+    task = value.get('task')
+    if not isinstance(task, dict) or not isinstance(task.get('name'), str) or not isinstance(task.get('path'), str):
+        raise WorkError('Invalid local outbox task')
+    drive_id(task.get('id'))
+    if not isinstance(value.get('body'), str) or len(value['body']) > 100000:
+        raise WorkError('Invalid local outbox body')
+    return value
+
+
+def local_queued(state: Path, task_id: str | None = None) -> list[tuple[Path, dict]]:
+    folder = state / LOCAL_OUTBOX
+    if not folder.exists():
+        return []
+    result = []
+    for path in sorted(folder.glob('*.json')):
+        value = valid_local_envelope(read_json(path))
+        if task_id is None or value['task']['id'] == task_id:
+            result.append((path, value))
+    return result
+
+
+def file_local_record(config: dict, value: dict) -> None:
+    """Move one durable outbox record into its book's `_업무기록` folder."""
+    book = validate_local_task(config, value['task'])
+    target = book / HISTORY_FOLDER / value['filename']
+    if target.exists():  # idempotent: already filed, immutable dated name
+        with open(target, 'rb') as handle:
+            existing = handle.read(MAX_LOCAL_RECORD_BYTES + 1).decode('utf-8', errors='replace')
+        if existing != value['body']:
+            raise TaskDeliveryError('A different history record already exists with this name')
+        return
+    write_user_file(target, value['body'])
+
+
+def flush_local_locked(config: dict, state: Path, task_id: str | None = None) -> dict:
+    delivered = 0
+    failures = []
+    blocked = set()
+    for path, value in local_queued(state, task_id):
+        if value['task']['id'] in blocked:
+            continue
+        try:
+            file_local_record(config, value)
+            path.unlink()
+            delivered += 1
+        except TaskDeliveryError as exc:
+            failures.append(str(exc))
+            blocked.add(value['task']['id'])
+        except (WorkError, OSError) as exc:
+            failures.append(str(exc))
+            break
+    remaining = len(local_queued(state, task_id))
+    return {'delivered': delivered, 'pending': remaining, 'issues': list(dict.fromkeys(failures))}
+
+
+def flush_local(config: dict, state: Path, task_id: str | None = None) -> dict:
+    with lock(state):
+        return flush_local_locked(config, state, task_id)
+
+
+def checkpoint_local(config: dict, state: Path, session: str, snapshot, now: datetime | None = None) -> dict:
+    snapshot = validate_snapshot(snapshot)
+    with lock(state):
+        task = binding(state, session)
+        if task.get('source') != 'local' or not isinstance(task.get('path'), str):
+            raise WorkError('Bound task is not a local task')
+        stamp = now or datetime.now(ZoneInfo('Asia/Seoul'))
+        if stamp.tzinfo is None:
+            raise WorkError('Checkpoint time must include a timezone')
+        stamp = stamp.astimezone(ZoneInfo('Asia/Seoul'))
+        event = uuid.uuid4().hex
+        filename = stamp.strftime('%Y-%m-%d_%H%M%S_%f_') + event + '.md'
+        envelope = {'schema_version': 1, 'source': 'local', 'task': task, 'filename': filename,
+                    'body': render(task, snapshot, stamp, event)}
+        # Durable first (private state dir): a validation or write failure while
+        # filing below must never lose the summary.
+        atomic_write(state / LOCAL_OUTBOX / (event + '.json'), json.dumps(envelope, ensure_ascii=False) + '\n')
+        current = session_state(state, session)
+        if current.get('task', {}).get('id') == task['id']:
+            current['dirty'] = False
+            save_session(state, session, current)
+        outcome = flush_local_locked(config, state, task['id'])
+        return {'task': task['name'], 'filename': filename, 'stored_locally': True, 'sync': outcome}
+
+
+def read_history_local(config: dict, task: dict, start: date | None, end: date | None,
+                       limit: int, before: str | None = None, state: Path | None = None) -> dict:
+    if start and end and start > end:
+        raise WorkError('Start date must not be after end date')
+    if not 1 <= limit <= 100:
+        raise WorkError('Limit must be between 1 and 100')
+    if before is not None and not NAME_RE.fullmatch(before):
+        raise WorkError('Invalid history pagination cursor')
+    book = validate_local_task(config, task)
+    history_dir = book / HISTORY_FOLDER
+    candidates: dict[str, dict] = {}
+    if history_dir.is_dir():
+        for path in history_dir.iterdir():
+            if not path.is_file() or path.is_symlink():
+                continue
+            match = NAME_RE.fullmatch(path.name)
+            if not match:
+                continue
+            try:
+                day = date.fromisoformat(match.group(1))
+            except ValueError:
+                continue
+            if (start and day < start) or (end and day > end):
+                continue
+            candidates[path.name] = {'source': 'local', 'path': path}
+    # Locally queued-but-not-yet-filed records (e.g. the book was renamed) are
+    # surfaced as pending so they are never silently missing from the history.
+    if state is not None:
+        for _path, value in local_queued(state, task['id']):
+            name = value['filename']
+            try:
+                day = date.fromisoformat(NAME_RE.fullmatch(name).group(1))
+            except (AttributeError, ValueError):
+                continue
+            if (start and day < start) or (end and day > end):
+                continue
+            candidates[name] = {'source': 'pending', 'body': value['body']}
+    names = sorted((name for name in candidates if before is None or name < before), reverse=True)
+    records = []
+    for name in names[:limit]:
+        entry = candidates[name]
+        if entry['source'] == 'pending':
+            records.append({'filename': name, 'source': 'pending', 'body': entry['body'], 'url': None})
+            continue
+        # Bounded read + lenient decode: one oversized or non-UTF-8 record must
+        # not abort the whole history read.
+        with open(entry['path'], 'rb') as handle:
+            raw = handle.read(MAX_LOCAL_RECORD_BYTES + 1)
+        body = '(기록이 너무 커서 생략됨)' if len(raw) > MAX_LOCAL_RECORD_BYTES else raw.decode('utf-8', errors='replace')
+        records.append({'filename': name, 'source': 'local', 'body': body,
+                        'url': entry['path'].resolve().as_uri()})
+    pending = len(local_queued(state, task['id'])) if state is not None else 0
+    return {'task': task['name'], 'records': records, 'matched': len(names),
+            'truncated': len(names) > limit,
+            'next_before': names[limit - 1] if len(names) > limit else None, 'pending': pending}
+
+
 def parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -437,6 +668,27 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config = read_config(args.config)
+        if (config.get('_source') or {}).get('type') == 'local':
+            no_sync = {'delivered': 0, 'pending': 0, 'issues': []}
+            if args.command == 'bind':
+                result = {'binding': bind(args.state_dir, session_id(), resolve_local(config, args.task, args.name)),
+                          'sync': no_sync}
+            elif args.command == 'mark':
+                result = {'binding': mark(args.state_dir, session_id()), 'sync': no_sync}
+            elif args.command == 'checkpoint':
+                data = json.loads(args.input.read_text(encoding='utf-8') if args.input else sys.stdin.read())
+                result = checkpoint_local(config, args.state_dir, session_id(), data)
+            elif args.command == 'flush':
+                result = flush_local(config, args.state_dir)
+            else:
+                task = resolve_local(config, args.task, args.name)
+                sync = flush_local(config, args.state_dir, task['id'])
+                result = read_history_local(config, task, args.start, args.end, args.limit,
+                                            args.before, args.state_dir)
+                if sync['pending'] or sync['delivered'] or sync['issues']:
+                    result['sync'] = sync
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         drive = HistoryDrive(config.get('rclone_remote', 'gdrive:'))
         if args.command == 'bind':
             result = {'binding': bind(args.state_dir, session_id(), resolve(drive, config, args.task, args.name)),

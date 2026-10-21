@@ -75,16 +75,30 @@ class RcloneDrive:
 def read_config(path: Path) -> dict[str, Any]:
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
-        drive_id(config["year_parent"]["id"])
         if config.get("schema_version") != 1:
             raise ValueError("Unsupported schema")
         if config["active_year"].get("mode") != "system":
             raise ValueError("Unsupported year mode")
         re.compile(config["task_number_regex"])
-        limits = config["cache"]
-        for key in ("max_parent_ids_per_index_query", "max_parent_queries", "max_age_hours"):
-            if int(limits[key]) < 1:
-                raise ValueError("Invalid cache limit")
+        # Source selects the work-library backend. Absence or "drive" keeps the
+        # Google Drive behavior; "local" points the same year-folder > NN번 task
+        # structure at a local filesystem directory (no rclone, no cache needed).
+        source = config.get("source") or {"type": "drive"}
+        stype = source.get("type", "drive")
+        if stype == "local":
+            root = Path(str(source["root"])).expanduser()
+            if not root.is_absolute() or not root.is_dir():
+                raise ValueError("Local source root must be an existing absolute directory")
+            config["_source"] = {"type": "local", "root": root}
+        elif stype == "drive":
+            drive_id(config["year_parent"]["id"])
+            limits = config["cache"]
+            for key in ("max_parent_ids_per_index_query", "max_parent_queries", "max_age_hours"):
+                if int(limits[key]) < 1:
+                    raise ValueError("Invalid cache limit")
+            config["_source"] = {"type": "drive"}
+        else:
+            raise ValueError("Unsupported source type")
         return config
     except (OSError, KeyError, TypeError, ValueError, re.error) as exc:
         raise WorkError("Private work-library configuration is missing or invalid") from exc
@@ -418,7 +432,11 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config = read_config(args.config)
-        result = execute(RcloneDrive(config.get("rclone_remote", "gdrive:")), config, parse_request(args.text))
+        if (config.get("_source") or {}).get("type") == "local":
+            import local_source
+            result = local_source.execute_local(config, parse_request(args.text))
+        else:
+            result = execute(RcloneDrive(config.get("rclone_remote", "gdrive:")), config, parse_request(args.text))
     except (WorkError, OSError, ValueError, KeyError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 1
@@ -433,13 +451,16 @@ def main() -> int:
         except (work_history.WorkError, OSError) as exc:
             result["history_binding"] = "not_bound"
             result["history_issue"] = str(exc)
-    try:
-        sync = work_history.flush(work_history.HistoryDrive(config.get("rclone_remote", "gdrive:")),
-                                  config, args.state_dir)
-        if sync["pending"] or sync["delivered"] or sync["issues"]:
-            result["history_sync"] = sync
-    except (work_history.WorkError, OSError) as exc:
-        result["history_sync_error"] = str(exc)
+    # Local history writes directly to the task folder, so there is no outbox to
+    # flush; retrying queued uploads applies only to the Drive backend.
+    if (config.get("_source") or {}).get("type") != "local":
+        try:
+            sync = work_history.flush(work_history.HistoryDrive(config.get("rclone_remote", "gdrive:")),
+                                      config, args.state_dir)
+            if sync["pending"] or sync["delivered"] or sync["issues"]:
+                result["history_sync"] = sync
+        except (work_history.WorkError, OSError) as exc:
+            result["history_sync_error"] = str(exc)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
