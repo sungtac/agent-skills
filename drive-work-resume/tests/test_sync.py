@@ -189,6 +189,39 @@ class DriveMirrorTests(SyncCase):
         self.assertFalse((self.history(self.a) / record_name(2, "b")).exists())
 
 
+    def test_duplicate_drive_record_names_are_skipped_not_guessed(self):
+        class DuplicateRecords(FakeDriveMirror):
+            def children(self, folder, name=None):
+                return [{"id": i, "name": record_name(1, "a"), "mimeType": "text/markdown"} for i in ("x1", "x2")]
+
+        drive = DuplicateRecords(books=["01_기획"], records={"01_기획": {record_name(1, "a"): "둘 중 하나"}})
+        report = sync_history(LocalBackend(), self.config, drive, self.config)
+        self.assertIn("Duplicate", report["skipped"][0])
+        self.assertFalse(report["complete"])
+        self.assertFalse(self.history(self.a).exists())
+
+    def test_existing_entry_is_never_reused_as_a_task_folder(self):
+        # A file in the way, or (on a case-insensitive filesystem such as /mnt/c)
+        # a folder "Notes" answering for "notes": skip that task, sync the rest.
+        (self.a / "2026" / "00_파일").write_text("x", encoding="utf-8")
+        (self.a / "2026" / "Notes").mkdir()
+
+        class CaseInsensitive(LocalBackend):
+            def list_books(self, parent_id):  # what the filesystem reports for "notes"
+                return [book for book in super().list_books(parent_id) if book["name"] != "Notes"]
+
+        drive = FakeDriveMirror(books=["00_파일", "01_기획", "Notes"],
+                                records={"00_파일": {record_name(1, "a"): "A"},
+                                         "01_기획": {record_name(2, "b"): "B"},
+                                         "Notes": {record_name(3, "c"): "C"}})
+        report = sync_history(CaseInsensitive(), self.config, drive, self.config)
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(len(report["skipped"]), 2)
+        self.assertEqual(report["to_primary"], 1)
+        self.assertTrue((self.history(self.a) / record_name(2, "b")).exists())
+        self.assertEqual(list((self.a / "2026" / "Notes").iterdir()), [])
+
+
 class MirrorConfigTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -254,6 +287,63 @@ class SyncLockTests(unittest.TestCase):
              patch.object(sys, "stdout", io.StringIO()):
             self.assertEqual(work_history.main(), 0)
         self.assertTrue(seen["held"])
+
+
+class MirrorCliTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name)
+        (self.base / "lib" / "2026" / "01_기획").mkdir(parents=True)
+        self.config = self.base / "config.json"
+        self.state = self.base / "state"
+
+    def write_config(self, year):
+        self.config.write_text(json.dumps({
+            "schema_version": 1, "active_year": {"mode": "system", "override": year},
+            "task_number_regex": REGEX, "year_parent": {"id": "abc123"},
+            "source": {"type": "local", "root": str(self.base / "lib")}, "mirror": {"type": "drive"},
+        }), encoding="utf-8")
+
+    def run_cli(self, *args, stdin=""):
+        import io
+        from unittest.mock import patch
+        argv = ["work_history.py", "--config", str(self.config), "--state-dir", str(self.state), *args]
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.object(sys, "stdout", out), \
+             patch.object(sys, "stdin", io.StringIO(stdin)), \
+             patch.object(work_history, "make_mirror", lambda config: (self.drive, config)), \
+             patch.dict("os.environ", {"CODEX_SESSION_ID": "s"}):
+            self.assertEqual(work_history.main(), 0, out.getvalue())
+        return json.loads(out.getvalue())
+
+    def test_sync_delivers_records_still_queued_for_the_mirror_library(self):
+        # Queued under the Drive source while offline, then the source was switched to local.
+        self.write_config("2026")
+        self.drive = FakeDriveMirror(books=["03_drive"], records={})
+        name = record_name(5, "e")
+        envelope = {"schema_version": 1, "filename": name, "body": "오프라인 기록",
+                    "task": {"id": "03_drive", "name": "03_drive", "year": "2026"}}
+        work_history.atomic_write(self.state / "outbox" / "e.json", json.dumps(envelope, ensure_ascii=False))
+        result = self.run_cli("sync")
+        self.assertEqual(result.get("mirror_flush", {}).get("delivered"), 1, result)
+        self.assertEqual(self.drive.records["03_drive"][name], "오프라인 기록")
+        self.assertEqual(list((self.state / "outbox").iterdir()), [])
+        self.assertTrue((self.base / "lib" / "2026" / "03_drive" / "_업무기록" / name).exists())
+
+    def test_checkpoint_mirrors_the_year_the_record_was_filed_under(self):
+        # Bound in 2026, checkpointed after New Year: the record is filed in 2026,
+        # so the mirror sync must look at 2026 too, not at a same-named 2027 book.
+        self.write_config("2026")
+        config = read_config(self.config)
+        work_history.bind(self.state, "s", work_history.resolve(LocalBackend(), config, "1", None))
+        (self.base / "lib" / "2027" / "01_기획").mkdir(parents=True)
+        self.write_config("2027")
+        self.drive = FakeDriveMirror(books=["01_기획"], records={"01_기획": {}})
+        result = self.run_cli("checkpoint", stdin=json.dumps({"goal": "g", "done": ["d"]}))
+        self.assertEqual(result["mirror_sync"]["to_mirror"], 1, result)
+        self.assertIn(result["filename"], self.drive.records["01_기획"])
+        self.assertFalse((self.base / "lib" / "2027" / "01_기획" / "_업무기록").exists())
 
 
 if __name__ == "__main__":
