@@ -123,7 +123,7 @@ def read_config(path: Path) -> dict[str, Any]:
             if config["_mirror"]["type"] == config["_source"]["type"]:
                 raise ValueError("mirror must be the other library type")
         return config
-    except (OSError, KeyError, TypeError, ValueError, re.error) as exc:
+    except (OSError, KeyError, TypeError, AttributeError, ValueError, re.error) as exc:
         raise WorkError("Private work-library configuration is missing or invalid") from exc
 
 
@@ -520,7 +520,7 @@ def main() -> int:
         config = read_config(args.config)
         backend = work_history.make_backend(config)
         result = execute(backend, config, parse_request(args.text))
-    except (WorkError, work_history.WorkError, OSError, ValueError, KeyError) as exc:
+    except (WorkError, work_history.WorkError, OSError, ValueError, KeyError, TypeError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 1
     # Bind only after a scoped task has been resolved. A conflicting unsaved

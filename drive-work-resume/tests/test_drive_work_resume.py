@@ -182,5 +182,42 @@ class DriveWorkResumeTests(unittest.TestCase):
         self.assertEqual(renamed["matches"], ["drive_index"])
 
 
+class MalformedConfigCLITests(unittest.TestCase):
+    """A malformed private config must yield the documented JSON error, never a traceback."""
+
+    SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+
+    def run_cli(self, config, *args):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            process = subprocess.run([sys.executable, *args[:1], "--config", str(path),
+                                      "--state-dir", str(Path(tmp) / "state"), *args[1:]],
+                                     capture_output=True, text=True, timeout=20,
+                                     env={"PATH": tmp, "HOME": tmp})  # no rclone reachable
+        self.assertEqual(process.returncode, 1, process.stderr)
+        self.assertEqual(process.stderr, "")
+        self.assertIn("error", json.loads(process.stdout))
+
+    def test_non_object_config_or_year_is_a_json_error(self):
+        for config in ([], {"schema_version": 1, "active_year": "system", "task_number_regex": "x"}):
+            self.run_cli(config, str(self.SCRIPTS / "work_history.py"), "flush")
+            self.run_cli(config, str(self.SCRIPTS / "drive_work_resume.py"), "--text", "현재 업무 리스트")
+
+    def test_null_cache_directory_is_a_json_error(self):
+        config = {"schema_version": 1, "year_parent": {"id": "library"},
+                  "active_year": {"mode": "system", "override": 2026},
+                  "task_number_regex": r"^(?P<number>0*[1-9][0-9]{0,2})_",
+                  "cache": {"directory": None, "max_age_hours": 1,
+                            "max_parent_ids_per_index_query": 5, "max_parent_queries": 5}}
+        with patch.object(sys, "argv", ["drive_work_resume.py", "--config", "unused", "--text", "1번에서 매뉴얼 찾아줘"]), \
+                patch.object(drive_work_resume, "read_config", return_value=config), \
+                patch.object(work_history, "make_backend", return_value=FakeDrive()), \
+                patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(drive_work_resume.main(), 1)
+        self.assertIn("error", json.loads(out.getvalue()))
+
+
 if __name__ == "__main__":
     unittest.main()
