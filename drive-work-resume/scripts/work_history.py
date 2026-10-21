@@ -51,9 +51,11 @@ def lock(state: Path):
 
 
 def session_id() -> str:
-    value = os.environ.get('CODEX_SESSION_ID', '')
+    # Provider-neutral: Codex and Claude Code each export their own host session ID.
+    value = os.environ.get('CODEX_SESSION_ID') or os.environ.get('CLAUDE_CODE_SESSION_ID') or ''
     if not SESSION_RE.fullmatch(value):
-        raise WorkError('Host session ID is unavailable; automatic task binding is disabled')
+        raise WorkError('Host session ID (CODEX_SESSION_ID or CLAUDE_CODE_SESSION_ID) is unavailable; '
+                        'automatic task binding is disabled')
     return value
 
 
