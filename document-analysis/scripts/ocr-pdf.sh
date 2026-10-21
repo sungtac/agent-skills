@@ -65,7 +65,12 @@ if ! TMPDIR="$temporary_dir" ocrmypdf --skip-text --deskew --rotate-pages -l "$l
 fi
 cat "$ocr_log"
 [[ -s "$output_pdf" ]] || { echo "OCR did not create a PDF." >&2; exit 1; }
-pdftotext "$output_pdf" "$output_text"
+if ! pdftotext "$output_pdf" "$output_text"; then
+  # A partial extracted.txt would otherwise pass verify-result.py unrecorded.
+  rm -f -- "$output_text"
+  echo "Text extraction from the OCR PDF failed: $output_pdf" >&2
+  exit 1
+fi
 [[ -s "$output_text" ]] || { echo "OCR PDF produced no extractable text." >&2; exit 1; }
 version="$(ocrmypdf --version 2>&1 | head -n 1 || true)"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
