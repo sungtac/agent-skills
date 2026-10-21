@@ -9,61 +9,41 @@ history. The generic code (drive_work_resume.execute and work_history's resolve,
 validate_task, checkpoint, flush and read_history) therefore serves both backends
 unchanged; nothing outside this module special-cases a local library.
 
-A folder's id is the SHA-256 of its resolved path, which satisfies the shared
-``drive_id`` validator. Only folders this instance has itself listed can be used,
-so history is always written under a verified direct child of the year folder.
-Symlinked folders and files are never listed or followed. Search is name/path
-based: there is no content index.
+A folder's id is the SHA-256 of its resolved path bytes, which satisfies the
+shared ``drive_id`` validator. Only folders this instance has itself listed can
+be used, so history is always written under a verified direct child of the year
+folder. Symlinked folders and files are never listed or followed. Search is
+name/path based: there is no content index.
 """
 from __future__ import annotations
 
 import hashlib
 import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from drive_work_resume import (FOLDER_MIME, HISTORY_FOLDER, NAME_RE, TaskDeliveryError,
-                               WorkError, current_year, title_matches)
+                               WorkError, current_year, title_matches, write_file_atomically)
 
 MAX_RECORD_BYTES = 200000
 
 
 def local_id(path: Path) -> str:
-    """A path-stable, drive_id-compatible identifier (64 hex chars)."""
-    return hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+    """A path-stable, drive_id-compatible identifier (64 hex chars).
+
+    Hashes the raw path bytes, so names that are not valid UTF-8 still work.
+    """
+    return hashlib.sha256(os.fsencode(path.resolve())).hexdigest()
 
 
 def local_url(path: Path) -> str:
     return path.resolve().as_uri()
 
 
-def write_user_file(path: Path, contents: str) -> None:
-    """Atomic write of user content with normal (umask) permissions.
-
-    Unlike work_history.atomic_write it never forces private 0o700/0o600, so a
-    history record written into a shared work library stays readable to others.
-    """
-    mask = os.umask(0)
-    os.umask(mask)
-    name = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-            name = handle.name
-            os.fchmod(handle.fileno(), 0o666 & ~mask)
-            handle.write(contents)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if name and os.path.exists(name):
-            os.unlink(name)
+def display(name: str) -> str:
+    """A printable form of a file-system name (undecodable bytes become U+FFFD)."""
+    return os.fsencode(name).decode("utf-8", errors="replace")
 
 
 def read_bounded(path: Path) -> str:
@@ -78,18 +58,51 @@ def read_bounded(path: Path) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _modified_iso(path: Path) -> str | None:
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _modified_iso(entry: os.DirEntry) -> str | None:
     try:
-        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        return datetime.fromtimestamp(entry.stat(follow_symlinks=False).st_mtime, timezone.utc).isoformat()
     except OSError:
         return None
 
 
-def _walk(root: Path):
-    """os.walk that neither follows nor reports symlinked directories."""
-    for current, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = sorted((d for d in dirs if not (Path(current) / d).is_symlink()), key=str.casefold)
-        yield Path(current), dirs, files
+def scan_tree(root: Path, problems: list[str]) -> Iterator[tuple[Path, list[os.DirEntry], list[os.DirEntry]]]:
+    """Yield (folder, sub-folder entries, regular-file entries) for a whole tree.
+
+    Symlinks, sockets and other special files are never yielded or followed.
+    os.scandir caches each entry's type, so classifying costs no extra syscall.
+    A folder that cannot be read is recorded in ``problems`` instead of being
+    skipped silently, so callers can report the walk as incomplete.
+    """
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as iterator:
+                entries = list(iterator)
+        except OSError:
+            problems.append("A folder could not be read; results may be incomplete")
+            continue
+        folders: list[os.DirEntry] = []
+        files: list[os.DirEntry] = []
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    folders.append(entry)
+                elif entry.is_file(follow_symlinks=False):
+                    files.append(entry)
+            except OSError:
+                problems.append("An entry could not be inspected; results may be incomplete")
+        folders.sort(key=lambda entry: entry.name.casefold())
+        yield current, folders, files
+        pending.extend(Path(entry.path) for entry in reversed(folders))
 
 
 class LocalBackend:
@@ -114,11 +127,8 @@ class LocalBackend:
     # ── listing and search ──────────────────────────────────────────────────
 
     def list_year(self, config: dict[str, Any]) -> dict[str, Any]:
-        root = config["_source"]["root"]
-        if not isinstance(root, Path):
-            root = Path(str(root)).expanduser()
         year = current_year(config)
-        target = root / year
+        target = config["_source"]["root"] / year
         if not target.is_dir() or target.is_symlink():
             raise WorkError(f"Expected exactly one {year} folder; found 0")
         return {"id": self._remember(target), "name": year, "mimeType": FOLDER_MIME,
@@ -127,55 +137,66 @@ class LocalBackend:
     def list_books(self, parent_id: str) -> list[dict[str, Any]]:
         parent = self._folder(parent_id)
         books = []
-        for entry in sorted(parent.iterdir(), key=lambda p: p.name.casefold()):
-            if entry.is_dir() and not entry.is_symlink():
-                books.append({"id": self._remember(entry), "name": entry.name, "parents": [parent_id],
-                              "mimeType": FOLDER_MIME, "url": local_url(entry)})
+        with os.scandir(parent) as iterator:
+            entries = [entry for entry in iterator
+                       if not entry.is_symlink() and entry.is_dir(follow_symlinks=False)]
+        for entry in sorted(entries, key=lambda entry: entry.name.casefold()):
+            path = Path(entry.path)
+            books.append({"id": self._remember(path), "name": display(entry.name), "parents": [parent_id],
+                          "mimeType": FOLDER_MIME, "url": local_url(path)})
         return books
 
     def run_task(self, config: dict[str, Any], request: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
         book = self._folder(task["id"])
-        now = datetime.now(timezone.utc).isoformat()
-        cache_report = {
-            "started_at": now, "fetched_at": now, "stale": False,
-            "enumeration_complete": True, "coverage_note": "local filesystem; live listing",
-            "refresh_reason": "live", "refresh_complete": True, "refresh_issue": None,
-            "folder_queries": 0,
-        }
+        problems: list[str] = []
         task_out = {"id": task["id"], "number": request["task_number"], "name": task["name"],
                     "url": task["url"], "source": self.source}
 
+        def cache_report() -> dict[str, Any]:
+            now = datetime.now(timezone.utc).isoformat()
+            complete = not problems
+            note = "; ".join(dict.fromkeys(problems)) if problems else "local filesystem; live listing"
+            return {
+                "started_at": now, "fetched_at": now, "stale": False,
+                "enumeration_complete": complete, "coverage_note": note,
+                "refresh_reason": "live", "refresh_complete": complete,
+                "refresh_issue": None if complete else note, "folder_queries": 0,
+            }
+
         if request["intent"] == "refresh_task":
             folder_count = file_count = 0
-            for _current, dirs, files in _walk(book):
-                folder_count += len(dirs)
+            for _current, folders, files in scan_tree(book, problems):
+                folder_count += len(folders)
                 file_count += len(files)
             return {
                 "intent": request["intent"], "year": current_year(config),
-                "task": task_out, "cache": cache_report,
+                "task": task_out, "cache": cache_report(),
                 "folder_count": folder_count, "file_count": file_count,
             }
 
         keyword = request["keyword"]
         hits: list[dict[str, Any]] = []
-        for current, _dirs, files in _walk(book):
-            for fname in files:
-                full = current / fname
-                if full.is_symlink() or not title_matches(fname, keyword):
+        for current, _folders, files in scan_tree(book, problems):
+            for entry in files:
+                title = display(entry.name)
+                if not title_matches(title, keyword):
                     continue
+                full = current / entry.name
                 hits.append({
-                    "id": local_id(full), "title": fname,
-                    "relative_path": str(full.relative_to(book)),
-                    "mime_type": None, "modified_time": _modified_iso(full),
+                    "id": local_id(full), "title": title,
+                    "relative_path": display(str(full.relative_to(book))),
+                    "mime_type": None, "modified_time": _modified_iso(entry),
                     "url": local_url(full), "matches": ["name"],
                 })
         index_report: dict[str, Any] = {"queries": 0, "complete": True, "issues": []}
         if request["search_mode"] == "indexed_and_title":
-            index_report["issues"] = ["Local source: name/path search only; no content index"]
+            # No content index exists locally: a 관련 search is never complete.
+            index_report = {"queries": 0, "complete": False,
+                            "issues": ["Local source: file contents were not searched; names/paths only"]}
         return {
             "intent": request["intent"], "year": current_year(config),
             "task": task_out, "keyword": keyword, "search_mode": request["search_mode"],
-            "cache": cache_report, "index": index_report,
+            "cache": cache_report(), "index": index_report,
             "results": sorted(hits, key=lambda item: item["relative_path"].casefold()),
         }
 
@@ -193,14 +214,16 @@ class LocalBackend:
 
     def children(self, folder_id: str, name: str | None = None) -> list[dict[str, Any]]:
         items = []
-        for path in sorted(self._folder(folder_id).iterdir()):
-            if path.is_symlink() or not path.is_file():
-                continue
-            if name is not None and path.name != name:
-                continue
-            items.append({"id": local_id(path), "name": path.name, "mimeType": None,
-                          "url": local_url(path)})
-        return items
+        with os.scandir(self._folder(folder_id)) as iterator:
+            for entry in iterator:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                if name is not None and entry.name != name:
+                    continue
+                path = Path(entry.path)
+                items.append({"id": local_id(path), "name": entry.name, "mimeType": None,
+                              "url": local_url(path)})
+        return sorted(items, key=lambda item: item["name"])
 
     def upload(self, folder_id: str, filename: str, body: str) -> None:
         if not NAME_RE.fullmatch(filename):
@@ -208,11 +231,13 @@ class LocalBackend:
         target = self._folder(folder_id) / filename
         if target.is_symlink():
             raise TaskDeliveryError("History record path is a symlink")
-        if target.exists():  # immutable dated names: only identical content is a no-op
-            if read_bounded(target) != body:
-                raise TaskDeliveryError("Remote history content conflicts with the queued record")
-            return
-        write_user_file(target, body)
+        try:
+            # Exclusive create: a record is immutable, even against a racing writer
+            # or a sync client; normal permissions keep a shared library readable.
+            write_file_atomically(target, body, mode=0o666 & ~_umask(), exclusive=True)
+        except FileExistsError:
+            if target.is_symlink() or read_bounded(target) != body:
+                raise TaskDeliveryError("Remote history content conflicts with the queued record") from None
 
     def download(self, folder_id: str, filename: str) -> str:
         if not NAME_RE.fullmatch(filename):

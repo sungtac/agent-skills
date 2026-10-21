@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import errno
 import json
 import os
 from pathlib import Path
@@ -114,6 +115,8 @@ def read_config(path: Path) -> dict[str, Any]:
         # Google Drive behavior; "local" points the same year-folder > NN번 task
         # structure at a local filesystem directory (no rclone, no cache needed).
         source = config.get("source") or {"type": "drive"}
+        if not isinstance(source, dict):
+            raise ValueError("source must be an object")
         stype = source.get("type", "drive")
         if stype == "local":
             root = Path(str(source["root"])).expanduser()
@@ -303,20 +306,52 @@ def load_cache(config: dict[str, Any], root_id: str, number: str) -> dict[str, A
     return None
 
 
-def save_cache(config: dict[str, Any], cache: dict[str, Any]) -> None:
-    path = cache_path(config, cache["task_folder_id"])
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+def write_file_atomically(path: Path, contents: str, *, mode: int, exclusive: bool = False) -> None:
+    """Write through a synced temporary file, then publish it in one step.
+
+    The single implementation behind the private state, cache, and history writers.
+    With ``exclusive`` an existing file is never replaced: FileExistsError is
+    raised instead, so immutable records cannot be overwritten by a racing writer.
+    """
     temp_name = None
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
             temp_name = handle.name
-            os.fchmod(handle.fileno(), 0o600)
-            json.dump(cache, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_name, path)
+            os.fchmod(handle.fileno(), mode)
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not exclusive:
+            os.replace(temp_name, path)
+        else:
+            try:
+                os.link(temp_name, path)  # atomic create-if-absent
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                if exc.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK):
+                    raise
+                # Filesystems without hard links: still create exclusively.
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(contents)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
+
+
+def save_cache(config: dict[str, Any], cache: dict[str, Any]) -> None:
+    path = cache_path(config, cache["task_folder_id"])
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    write_file_atomically(path, json.dumps(cache, ensure_ascii=False, indent=2), mode=0o600)
 
 
 def cache_is_stale(cache: dict[str, Any], max_age_hours: int) -> bool:

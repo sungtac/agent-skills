@@ -94,6 +94,16 @@ class LocalConfigTests(LocalCase):
         with self.assertRaises(WorkError):
             read_config(write_config(self.base, self.base / "c.json", source={"type": "ftp"}))
 
+    def test_non_object_source_is_a_config_error_not_a_crash(self):
+        for bad in ("local", ["local"]):
+            with self.assertRaises(WorkError):
+                read_config(write_config(self.base, self.base / "c.json", source=bad))
+
+    def test_unvalidated_local_config_never_falls_back_to_drive(self):
+        raw = {"source": {"type": "local", "root": str(self.base)}}
+        with self.assertRaisesRegex(WorkError, "read_config"):
+            work_history.make_backend(raw)
+
     def test_absent_source_defaults_to_drive(self):
         path = self.base / "c.json"
         path.write_text(json.dumps({
@@ -128,10 +138,43 @@ class LocalListAndSearchTests(LocalCase):
         self.assertEqual(out["results"][0]["matches"], ["name"])
         self.assertEqual(out["task"]["source"], "local")
 
-    def test_related_search_notes_no_content_index(self):
+    def test_related_search_is_reported_incomplete(self):
         out = self.run_text("1번에서 관련 매뉴얼 찾아줘")
         self.assertEqual(out["search_mode"], "indexed_and_title")
+        self.assertFalse(out["index"]["complete"])  # contents were never searched
         self.assertTrue(out["index"]["issues"])
+
+    def test_unreadable_subfolder_marks_search_incomplete(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read mode-000 folders")
+        locked = self.base / "2026" / "01_기획" / "locked"
+        locked.mkdir()
+        (locked / "매뉴얼 비공개.txt").write_text("z", encoding="utf-8")
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        out = self.run_text("1번에서 매뉴얼 찾아줘")
+        self.assertFalse(out["cache"]["enumeration_complete"])
+        self.assertFalse(out["cache"]["refresh_complete"])
+        self.assertIn("could not be read", out["cache"]["coverage_note"])
+
+    def test_non_utf8_names_do_not_break_listing_or_search(self):
+        year = os.fsencode(self.base / "2026")
+        os.mkdir(year + b"/03_\xc7\xd1\xb1\xdb")  # CP949 bytes, invalid UTF-8
+        os.mkdir(os.fsencode(self.base / "2026" / "02_개발") + b"/\xb8\xc5\xb4\xba\xbe\xf3")
+        with open(os.fsencode(self.base / "2026" / "02_개발") + b"/\xb8\xc5\xb4\xba\xbe\xf3/report.txt", "w") as f:
+            f.write("r")
+        listed = self.run_text("현재 업무 리스트")
+        self.assertTrue(any(f["name"].startswith("03_") and "�" in f["name"]
+                            for f in listed["folders"]))
+        found = self.run_text("2번에서 report 찾아줘")
+        self.assertEqual(len(found["results"]), 1)
+        for out in (listed, found):  # must print as the JSON contract requires
+            json.dumps(out, ensure_ascii=False).encode("utf-8")
+
+    def test_refresh_counts_only_regular_files(self):
+        book = self.base / "2026" / "01_기획"
+        os.symlink(book / "메모.txt", book / "메모 링크.txt")
+        self.assertEqual(self.run_text("1번 새로고침 해줘")["file_count"], 2)
 
     def test_refresh_counts_descendants(self):
         out = self.run_text("1번 새로고침 해줘")
@@ -259,6 +302,36 @@ class LocalHistoryTests(LocalCase):
         with self.assertRaisesRegex(WorkError, "different work library"):
             work_history.checkpoint(work_history.HistoryDrive(), self.config, self.state,
                                     self.session, self.snapshot())
+
+    def test_switching_source_with_unsaved_work_names_the_way_out(self):
+        work_history.bind(self.state, self.session,
+                          {"id": "a" * 64, "name": "01_업무", "number": "1", "year": "2026", "url": None})
+        local_task = work_history.resolve(LocalBackend(), self.config, "1", None)
+        with self.assertRaisesRegex(WorkError, "switch the config source back to drive"):
+            work_history.bind(self.state, self.session, local_task)
+        with self.assertRaisesRegex(WorkError, "switch the config source back to drive"):
+            self.checkpoint()
+
+    def test_existing_record_is_never_overwritten(self):
+        backend = LocalBackend()
+        task = self.bind_task("1")
+        work_history.validate_task(backend, self.config, task)
+        folder = backend.history_folder(task["id"], create=True)
+        name = "2026-02-01_120000_000000_" + "e" * 32 + ".md"
+        (self.history_dir() / name).write_text("원본", encoding="utf-8")
+        backend.upload(folder, name, "원본")  # identical content: idempotent no-op
+        with self.assertRaises(TaskDeliveryError):
+            backend.upload(folder, name, "다른 내용")
+        self.assertEqual((self.history_dir() / name).read_text(encoding="utf-8"), "원본")
+
+    def test_exclusive_write_refuses_existing_file(self):
+        from drive_work_resume import write_file_atomically
+        target = self.base / "record.md"
+        target.write_text("first", encoding="utf-8")
+        with self.assertRaises(FileExistsError):
+            write_file_atomically(target, "second", mode=0o644, exclusive=True)
+        self.assertEqual(target.read_text(encoding="utf-8"), "first")
+        self.assertEqual(sorted(p.name for p in self.base.iterdir() if p.name.startswith("tmp")), [])
 
     def test_local_flush_never_delivers_drive_outbox(self):
         drive_record = self.state / "outbox" / ("d" * 32 + ".json")

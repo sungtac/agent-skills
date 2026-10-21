@@ -19,7 +19,8 @@ from zoneinfo import ZoneInfo
 
 from drive_work_resume import (DEFAULT_CONFIG, FOLDER_MIME, HISTORY_FOLDER, NAME_RE, RcloneDrive,
                                TaskDeliveryError, WorkError, current_year, drive_id, file_url,
-                               parent_filter, quote_drive, read_config, resolve_task)
+                               parent_filter, quote_drive, read_config, resolve_task,
+                               write_file_atomically)
 
 STATE_DIR = Path.home() / '.codex/drive-work-resume'
 SESSION_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
@@ -33,23 +34,7 @@ def private_dir(path: Path) -> None:
 
 def atomic_write(path: Path, contents: str) -> None:
     private_dir(path.parent)
-    name = None
-    try:
-        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=path.parent, delete=False) as handle:
-            name = handle.name
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(contents)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if name and os.path.exists(name):
-            os.unlink(name)
+    write_file_atomically(path, contents, mode=0o600)
 
 
 @contextmanager
@@ -124,6 +109,13 @@ def bind(state: Path, session: str, task: dict, dirty: bool = True) -> dict:
     with lock(state):
         old = session_state(state, session)
         if old.get('dirty') and old.get('task', {}).get('id') != task['id']:
+            old_source = old.get('task', {}).get('source', 'drive')
+            if old_source != task.get('source', 'drive'):
+                # Without this hint a source switch leaves the session stuck:
+                # the other backend refuses to file the old task (see checkpoint).
+                raise WorkError(f'Previous task has unsaved work in the {old_source} work library; '
+                                f'switch the config source back to {old_source} and checkpoint it '
+                                'before switching tasks')
             raise WorkError('Previous task has unsaved work; checkpoint it before switching tasks')
         value = {'schema_version': 1, 'task': task, 'dirty': bool(dirty or old.get('dirty'))}
         save_session(state, session, value)
@@ -326,8 +318,10 @@ def checkpoint(drive, config: dict, state: Path, session: str, snapshot, now: da
     with lock(state):
         task = binding(state, session)
         # A task bound under one work library must never be filed into another.
-        if task.get('source', 'drive') != drive.source:
-            raise WorkError('The bound task belongs to a different work library source')
+        bound_source = task.get('source', 'drive')
+        if bound_source != drive.source:
+            raise WorkError(f'The bound task belongs to a different work library ({bound_source}); '
+                            f'switch the config source back to {bound_source} to checkpoint it')
         # Offline should not lose a summary: verified binding is checked again during delivery.
         stamp = now or datetime.now(ZoneInfo('Asia/Seoul'))
         if stamp.tzinfo is None:
@@ -409,8 +403,15 @@ def read_history(drive, config: dict, state: Path, task: dict, start: date | Non
 
 
 def make_backend(config: dict):
-    """Select the work-library backend once from the validated config."""
-    if (config.get('_source') or {}).get('type') == 'local':
+    """Select the work-library backend once from the config normalized by read_config."""
+    source = config.get('_source')
+    if source is None:
+        # A raw config that names a source was never validated; silently falling
+        # back to Drive would run rclone against the wrong library.
+        if config.get('source') is not None:
+            raise WorkError('Configuration must be loaded with read_config before use')
+        source = {'type': 'drive'}
+    if source['type'] == 'local':
         from local_source import LocalBackend
         return LocalBackend()
     return HistoryDrive(config.get('rclone_remote', 'gdrive:'))
