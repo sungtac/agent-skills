@@ -156,6 +156,24 @@ class DriveMirrorTests(SyncCase):
         self.assertEqual(report["issues"], ["simulated offline"])
         self.assertFalse(report["complete"])
 
+    def test_drive_records_are_copied_byte_exactly_and_non_utf8_is_refused(self):
+        class RawDriveMirror(FakeDriveMirror):
+            # Real HistoryDrive.download over a faked rclone transport returning bytes.
+            remote = "gdrive:"
+            download = HistoryDrive.download
+
+            def command(self, args):
+                folder = args[args.index("--drive-root-folder-id") + 1]
+                return self.records[folder][args[1].split(":", 1)[1]]
+
+        crlf, bad = record_name(1, "a"), record_name(2, "b")
+        drive = RawDriveMirror(books=["01_기획"], records={"01_기획": {crlf: "윈도우\r\n기록\n".encode(),
+                                                                         bad: b"\xff\xfe bad"}})
+        report = sync_history(LocalBackend(), self.config, drive, self.config)
+        self.assertEqual((self.history(self.a) / crlf).read_bytes(), "윈도우\r\n기록\n".encode())
+        self.assertIn("not UTF-8", report["skipped"][0])
+        self.assertFalse((self.history(self.a) / bad).exists())
+
 
 class MirrorConfigTests(unittest.TestCase):
     def setUp(self):

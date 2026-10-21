@@ -227,11 +227,13 @@ def queued(state: Path, task_id: str | None = None, outbox: str = 'outbox') -> l
 class HistoryDrive(RcloneDrive):
     creates_books = False  # sync never creates task folders on the owner's Drive
 
-    def command(self, args: list[str]) -> str:
+    def command(self, args: list[str]) -> bytes:
+        # Bytes, not text mode: text mode would rewrite CRLF and raise
+        # UnicodeDecodeError on a non-UTF-8 record.
         command = ['rclone', *args, '--retries', '1', '--low-level-retries', '6',
                    '--contimeout', '8s', '--timeout', '45s']
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=70, check=False)
+            result = subprocess.run(command, capture_output=True, timeout=70, check=False)
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             raise WorkError('Google Drive operation could not be completed') from exc
         if result.returncode:
@@ -283,10 +285,17 @@ class HistoryDrive(RcloneDrive):
             raise TaskDeliveryError('Remote history content conflicts with the queued record')
 
     def download(self, folder: str, filename: str, strict: bool = False) -> str:
-        # rclone either returns the exact body or fails, so strict needs no extra check.
+        """Read a record byte-exactly. ``strict`` (used when copying) refuses non-UTF-8
+        instead of substituting replacement characters, as LocalBackend.download does."""
         if not NAME_RE.fullmatch(filename):
             raise WorkError('Invalid history filename')
-        return self.command(['cat', self.remote + filename, '--drive-root-folder-id', folder])
+        raw = self.command(['cat', self.remote + filename, '--drive-root-folder-id', folder])
+        if not strict:
+            return raw.decode('utf-8', errors='replace')
+        try:
+            return raw.decode('utf-8')
+        except ValueError:
+            raise TaskDeliveryError(f"'{filename}' is not a valid history record (not UTF-8)") from None
 
     def ensure_book(self, config: dict, name: str) -> dict:
         # Task folders on Drive belong to the owner; history sync never creates them.
