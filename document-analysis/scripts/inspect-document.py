@@ -40,6 +40,14 @@ def main() -> int:
         print(f"Not a readable file: {source}", file=sys.stderr)
         return 2
 
+    # Guard against clobbering the document we are only meant to inspect:
+    # resolve() collapses symlinks and relative paths, so an --output that
+    # points back at the source (directly or via a link) is rejected before
+    # any write.
+    if arguments.output is not None and arguments.output.expanduser().resolve() == source:
+        print(f"--output must differ from the source document: {source}", file=sys.stderr)
+        return 2
+
     result: dict[str, object] = {
         "schema_version": 1,
         "inspected_at": datetime.now(timezone.utc).isoformat(),
