@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -33,6 +34,12 @@ class FakeDocument:
     def __len__(self):
         return 1
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
 
 def load_script():
     spec = importlib.util.spec_from_file_location("extract_structure_under_test", SCRIPT)
@@ -52,7 +59,12 @@ class ExtractStructureTests(unittest.TestCase):
             source.write_bytes(b"pdf")
             analysis = root / "analysis"
             analysis.mkdir()
-            (analysis / "manifest.json").write_text("{}\n", encoding="utf-8")
+            # Manifest must carry the source's sha256 so the provenance guard
+            # (added to extract-structure.py) passes for the real source.
+            (analysis / "manifest.json").write_text(
+                json.dumps({"source_sha256": hashlib.sha256(b"pdf").hexdigest()}) + "\n",
+                encoding="utf-8",
+            )
             fake_pymupdf = SimpleNamespace(open=lambda _: FakeDocument(), __version__="test")
             with patch.dict(sys.modules, {"pymupdf": fake_pymupdf}), patch.object(module.os, "spawnv", return_value=recorder_status), patch.object(sys, "argv", [str(SCRIPT), str(source), str(analysis)]):
                 status = module.main()
