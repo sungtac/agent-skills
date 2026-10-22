@@ -1,0 +1,25 @@
+{
+  "schema_version": "shared-skills/v1",
+  "source_root": "/home/edge_ai/shared-skills",
+  "targets": [
+    "/home/edge_ai/.codex/skills",
+    "/home/edge_ai/.claude/skills"
+  ],
+  "exclude_directories": [".system"],
+  "skills": {
+    "ai-readiness-cartography": {"codex": "supported", "claude": "supported", "dependencies": ["python3"]},
+    "codex-image": {"codex": "supported", "claude": "limited", "dependencies": ["Codex image_gen"]},
+    "design-taste-frontend": {"codex": "supported", "claude": "supported", "dependencies": []},
+    "diagnosing-bugs": {"codex": "supported", "claude": "supported", "dependencies": ["shell", "read access"]},
+    "diagram-design": {"codex": "supported", "claude": "supported", "dependencies": []},
+    "edgeai-public-notice": {"codex": "supported", "claude": "supported", "dependencies": []},
+    "handoff": {"codex": "supported", "claude": "supported", "dependencies": ["temporary directory"]},
+    "last30days": {"codex": "limited", "claude": "supported", "dependencies": ["network", "web/search access"]},
+    "native-enhance-pptx": {"codex": "supported", "claude": "supported", "dependencies": ["PPTX/OOXML tooling"]},
+    "orchestration": {"codex": "conditional", "claude": "conditional", "dependencies": ["git", "tmux", "agentlayer", "worker CLIs"]},
+    "ppt-master": {"codex": "supported", "claude": "supported", "dependencies": ["PPT/SVG pipeline"]},
+    "ppt-template-fill": {"codex": "conditional", "claude": "conditional", "dependencies": ["PPTX", "OfficeCLI"]},
+    "skill-guide": {"codex": "supported", "claude": "supported", "dependencies": ["shared-skills manifest"]},
+    "tdd": {"codex": "supported", "claude": "supported", "dependencies": ["project test runner"]}
+  }
+}

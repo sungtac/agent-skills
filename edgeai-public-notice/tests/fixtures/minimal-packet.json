@@ -1,0 +1,8 @@
+{
+  "case_id": "fixture-001",
+  "as_of": "2026-09-01",
+  "notice_id": "fixture-notice-v1",
+  "document_ids": ["DOC-01"],
+  "selected_unit_id": null,
+  "status": "RESTRICTED"
+}
